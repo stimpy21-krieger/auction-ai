@@ -12,44 +12,70 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from io import BytesIO
 
 # =====================================================================
-# 🎨 1. 스트림릿 기본 설정 & 타이틀 변경
+# 🎨 1. 스트림릿 기본 설정 (모바일 최적화 & macOS 스타일 적용)
 # =====================================================================
-st.set_page_config(page_title="AI 말소할 등기 목록 추출기", page_icon="📜", layout="wide")
-st.title("📜 AI 말소할 등기 목록 추출기")
+st.set_page_config(page_title="AI 말소할 등기 목록 추출기", page_icon="📜", layout="centered")
 
 st.markdown("""
-네이버 OCR과 Gemini AI를 활용하여 등기부등본에서 **'말소할 등기 목록'**을 자동으로 추출해 주는 보조 프로그램입니다.
+<style>
+    /* 애플 시스템 폰트 및 전체 배경색 */
+    html, body, [class*="css"] {
+        font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Pretendard", Roboto, sans-serif;
+    }
+    
+    /* 버튼 애플 스타일 (둥글고 부드러운 그림자) */
+    .stButton > button {
+        border-radius: 12px;
+        font-weight: 600;
+        border: none;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        transition: all 0.2s ease-in-out;
+    }
+    .stButton > button:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 6px 12px rgba(0,0,0,0.15);
+    }
+    
+    /* 파일 업로드 박스 디자인 */
+    [data-testid="stFileUploadDropzone"] {
+        border-radius: 16px;
+        border: 2px dashed #007AFF;
+        background-color: #F2F2F7;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-🚨 **[주의사항 및 면책조항]**
-* AI의 판독 결과는 100% 완벽하지 않을 수 있으며, 복잡한 특약이나 예외 사항에 대해 오류가 발생할 수 있습니다.
-* 본 프로그램의 결과는 **참고용**으로만 활용하시고, 실제 법원 제출 및 입찰 전에는 반드시 **전문가의 최종 검토**를 거치시기 바랍니다.
+st.title("📜 AI 말소할 등기 목록 추출기")
 
-🔒 **[개인정보 보호 및 보안]**
-* 업로드하신 등기부등본 사진은 서버에 일절 저장되지 않습니다.
-* 권리분석이 완료되거나 브라우저를 닫으면 업로드된 자료는 즉시 메모리에서 영구 삭제되므로 안심하고 사용하셔도 됩니다.
-""")
-st.markdown("---")
+with st.expander("🚨 주의사항 및 개인정보 보호 안내 (클릭해서 확인)", expanded=False):
+    st.markdown("""
+    네이버 OCR과 Gemini AI를 활용하여 등기부등본에서 **'말소할 등기 목록'**을 자동으로 추출해 주는 보조 프로그램입니다.
+
+    * **[면책조항]** AI 판독 결과는 100% 완벽하지 않을 수 있으며, 복잡한 특약이나 예외 사항에 대해 오류가 발생할 수 있습니다. 본 프로그램의 결과는 참고용으로만 활용하시고, 실제 법원 제출 전 반드시 전문가의 검토를 거치시기 바랍니다.
+    * **[개인정보 보호 및 보안]** 업로드하신 등기부등본 사진은 서버에 일절 저장되지 않습니다. 권리분석이 완료되거나 브라우저를 닫으면 즉시 메모리에서 영구 삭제되므로 안심하고 사용하셔도 됩니다.
+    """)
 
 # =====================================================================
-# 🔑 2. API 키 자동 로드 (스트림릿 비밀 금고에서 가져오기)
+# 🔑 2. API 키 자동 로드 (스트림릿 비밀 금고)
 # =====================================================================
-# 이제 왼쪽 사이드바 입력창은 사라지고, 서버에서 알아서 키를 꺼내옵니다.
 try:
     NAVER_API_URL = st.secrets["NAVER_API_URL"]
     NAVER_SECRET_KEY = st.secrets["NAVER_SECRET_KEY"]
     GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
 except KeyError:
-    st.error("앗! 서버의 비밀 금고(Secrets)에 API 키가 설정되지 않았습니다. 관리자 설정이 필요합니다.")
+    st.error("서버 관리자 설정 필요: 비밀 금고(Secrets)에 API 키가 설정되지 않았습니다.")
     st.stop()
 
 # =====================================================================
-# 🧠 3. 지식 베이스 및 AI 룰 (개발자님 작성 완벽본)
+# 🧠 3. 지식 베이스 및 필터링 룰 (개발자님 작성 완벽본 전체)
 # =====================================================================
 base_keywords = ['근저당', '저당', '담보물권', '가압류', '압류', '체납처분압류', '강제경매개시결정', '임의경매개시결정', '경매개시결정', '담보가등기']
 always_keep_keywords = ['건물철거', '토지인도', '법정지상권', '관습법상', '관습상', '분묘기지권', '예고등기', '요역지', '지역권', '도시철도법', '구분지상권', '채무자회생법', '특별매각조건', '인수조건']
 ai_check_keywords = ['전세권', '임차권', '가처분', '처분금지가처분', '가등기', '소유권이전청구권', '지상권', '부합물', '종물', '다른 약정', '특약']
 
-# 개발자님이 꽉 채워주신 완벽한 지식 베이스
+# 🌟 안내문 제거 필터
+ignore_keywords = ["관할등기소", "본등기사항증명서", "사법부내부", "열람용이므로", "법적인효력", "실선으로그어진", "말소사항을표시", "기록사항없는", "기록사항없음", "열람일시", "사법부 말소사항"]
+
 knowledge_base = """
 [업로드된 문서들을 바탕으로, 경매에서 **'말소기준권리'가 될 수 있는 모든 권리의 명칭(키워드)**을 쉼표로 구분해서 리스트 형태로 나열해 줘. (예: 근저당권, 가압류, 압류 등). 그리고 최선순위 전세권처럼 '특정 조건(배당요구 등)'이 충족되어야만 말소기준권리가 되는 예외적인 권리도 따로 명시해 줘.
 
@@ -139,7 +165,7 @@ knowledge_base = """
 • 대항력 있는 임차권: 최선순위 임차인이 배당요구를 하였더라도, 매각대금에서 보증금 전액을 배당(변제)받았는지 계산해야 합니다. 보증금이 모두 변제되지 않았다면 배당받지 못한 잔액이 매수인에게 그대로 인수되므로, 단순 날짜뿐만 아니라 배당표(변제 여부)에 대한 분석이 동반되어야 합니다.
 3. 등기 기록의 실질과 채권신고 여부를 따져야 하는 최선순위 '가등기'
 • 최선순위 가등기는 원칙적으로 매수인이 인수하는 '순위보전가등기'인지, 아니면 저당권처럼 매각으로 소멸하는 '담보가등기'인지 구분해야 합니다.
-• 등기기록의 내용만으로는 이를 명확히 단정할 수 없으며, 법원의 최고에 따라 가등기권자가 채권신고를 했는지의 여부 등 실질적인 내용을 보조적으로 파악해야 인수/말소를 판단할 수 있습니다.
+• 등기기록의 내용만으로는 이를 명확히 단정할 수 단정할 수 없으며, 법원의 최고에 따라 가등기권자가 채권신고를 했는지의 여부 등 실질적인 내용을 보조적으로 파악해야 인수/말소를 판단할 수 있습니다.
 4. 타 권리와의 종속 관계(부종성)를 파악해야 하는 '담보지상권'
 • 근저당권 등 담보권자가 목적물의 담보가치 하락을 막기 위해 저당권과 함께 설정해 두는 지상권을 '담보지상권'이라 합니다.
 • 일반적인 선순위 지상권은 인수되는 것이 원칙이지만, 이 담보지상권은 메인 권리인 '피담보채권(근저당권)'이 변제나 시효로 소멸하게 되면 그에 부종하여 함께 소멸하는 특성을 가집니다. 따라서 연관된 근저당권의 상태를 함께 분석해야 합니다.
@@ -180,14 +206,6 @@ knowledge_base = """
 특약 및 기타: 다른 약정, 부합물 제외, 종물 배제]
 """
 
-# 세션 상태(저장소) 초기화
-if 'analysis_done' not in st.session_state:
-    st.session_state.analysis_done = False
-if 'final_df' not in st.session_state:
-    st.session_state.final_df = None
-if 'malso_df' not in st.session_state:
-    st.session_state.malso_df = None
-
 def ask_gemini_for_rights(record_text, base_date, model):
     prompt = f"""
     너는 대한민국 법원 경매 권리분석 최고 전문가야.
@@ -211,36 +229,36 @@ def ask_gemini_for_rights(record_text, base_date, model):
     return model.generate_content(prompt).text
 
 # =====================================================================
-# 🗂️ 4. 스텝-바이-스텝 탭(Tab) 화면 구성
+# 🔄 4. 화면 자동 전환 로직 (세션 상태 관리)
 # =====================================================================
-tab1, tab2, tab3 = st.tabs(["📄 1단계: 서류 접수", "🔍 2단계: AI 판독소", "📑 3단계: 최종 서류 발급"])
+if 'step' not in st.session_state:
+    st.session_state.step = 1  
+if 'final_df' not in st.session_state:
+    st.session_state.final_df = None
+if 'malso_df' not in st.session_state:
+    st.session_state.malso_df = None
 
-with tab1:
-    st.header("1. 등기부등본 사진 업로드")
-    st.markdown("분석할 등기부등본 사진(JPG, PNG)을 모두 선택하여 올려주세요.")
-    
-    # 웹 전용 파일 업로더 (코랩의 files.upload() 대체)
-    uploaded_files = st.file_uploader("여기에 파일을 드래그하거나 클릭하여 업로드하세요", accept_multiple_files=True, type=['jpg', 'jpeg', 'png'])
+# =====================================================================
+# 📱 [1단계 화면] 사진 업로드 및 판독 로직
+# =====================================================================
+if st.session_state.step == 1:
+    st.subheader("📸 1. 문서 업로드")
+    uploaded_files = st.file_uploader("등기부등본 사진(JPG, PNG)을 모두 올려주세요", accept_multiple_files=True, type=['jpg', 'jpeg', 'png'])
 
-    if st.button("🚀 권리분석 시작", type="primary"):
-        if not NAVER_API_URL or not NAVER_SECRET_KEY or not GEMINI_API_KEY:
-            st.error("앗! 왼쪽 사이드바에서 API 키를 먼저 모두 입력해주세요.")
-        elif not uploaded_files:
-            st.warning("업로드된 파일이 없습니다.")
+    if st.button("🚀 권리분석 시작", type="primary", use_container_width=True):
+        if not uploaded_files:
+            st.warning("사진을 먼저 업로드해주세요.")
         else:
             try:
-                # Gemini API 연결 세팅
                 genai.configure(api_key=GEMINI_API_KEY)
                 model = genai.GenerativeModel('gemini-2.5-flash')
                 
-                with st.spinner('네이버 OCR 엔진이 문서를 읽고 있습니다... (약 10~20초 소요)'):
-                    # --- [OCR 추출 파트] ---
+                with st.spinner('네이버 AI가 문서를 스캔 중입니다... (약 10~20초)'):
                     all_clean_rows = []
                     for file in sorted(uploaded_files, key=lambda x: x.name):
                         file_bytes = file.getvalue()
                         request_json = {'images': [{'format': file.name.split('.')[-1], 'name': 'demo'}], 'requestId': str(uuid.uuid4()), 'version': 'V2', 'timestamp': int(round(time.time() * 1000))}
                         payload = {'message': json.dumps(request_json).encode('UTF-8')}
-                        # 웹 환경 파일 전송 포맷으로 변경
                         file_data = [('file', (file.name, file_bytes, file.type))]
                         headers = {'X-OCR-SECRET': NAVER_SECRET_KEY}
                         
@@ -269,17 +287,21 @@ with tab1:
                                 page_rows.append(" ".join([item['text'] for item in current_row]))
                             all_clean_rows.extend(page_rows)
                         else:
-                            st.error(f"OCR 오류 발생: {response.status_code}")
+                            st.error("OCR 스캔 중 오류가 발생했습니다.")
                             st.stop()
 
                 with st.spinner('파이썬 엔진이 기초 권리를 분석 중입니다...'):
-                    # --- [파이썬 데이터 정제 파트] ---
                     records, current_record, current_gu = [], {}, None
                     rank_pattern = re.compile(r'^([1-9]\d*[-]?\d*)(?:\s+|번|(?=[가-힣]))') 
                     date_pattern = re.compile(r'(\d{4})년\s*(\d{1,2})월\s*(\d{1,2})일')
 
                     for row in all_clean_rows:
                         clean_row = row.replace(" ", "")
+                        
+                        # 🌟 꼬리말 필터 적용: 쓸데없는 안내문 쓰레기통으로!
+                        if any(kw in clean_row for kw in ignore_keywords):
+                            continue
+                            
                         if "갑구" in clean_row and "소유권" in clean_row: current_gu = "갑구"; continue
                         if "을구" in clean_row and "소유권" in clean_row: current_gu = "을구"; continue
                         if current_gu is None or "순위번호" in row or "등기목적" in row or "접수" in row: continue
@@ -341,8 +363,7 @@ with tab1:
 
                     df['결과'] = df.apply(determine_status, axis=1)
 
-                with st.spinner('Gemini AI가 복잡한 예외 권리를 정밀 해석 중입니다...'):
-                    # --- [Gemini AI 파트] ---
+                with st.spinner('Gemini AI가 복잡한 권리를 정밀 해석 중입니다...'):
                     df['AI_상세이유'] = ""
                     for index, row in df.iterrows():
                         if "🤖 AI 정밀해석" in str(row['결과']):
@@ -350,65 +371,68 @@ with tab1:
                                 ai_answer = ask_gemini_for_rights(row['전체내용'], base_date, model)
                                 if "결과: 인수" in ai_answer: df.at[index, '결과'] = "✅ 인수 (AI판단)"
                                 elif "결과: 말소" in ai_answer: df.at[index, '결과'] = "❌ 말소 (AI판단)"
-                                elif "결과: 추가확인" in ai_answer: df.at[index, '결과'] = "⚠️ 서류확인 요망 (AI)"
+                                elif "결과: 추가확인" in ai_answer: df.at[index, '결과'] = "⚠️ 서류확인 요망"
                                 
                                 df.at[index, 'AI_상세이유'] = ai_answer.split("이유:")[-1].strip() if "이유:" in ai_answer else ai_answer
                                 time.sleep(1)
                             except Exception as e:
                                 df.at[index, 'AI_상세이유'] = "API 통신 오류"
 
-                    # 결과 필터링
                     malso_df = df[df['결과'].str.contains('말소')][['구분', '순위번호', '등기목적', '접수일자_표시']]
                     malso_df.columns = ['구분', '순위번호', '등기목적', '접수일자']
                     malso_df.index = range(1, len(malso_df) + 1)
 
-                    # 세션에 결과 저장 (탭 이동 시 유지)
                     st.session_state.final_df = df
                     st.session_state.malso_df = malso_df
-                    st.session_state.analysis_done = True
-                
-                st.success("✅ 모든 분석이 완료되었습니다! 2단계와 3단계 탭을 확인해주세요.")
+                    
+                    # 🌟 모든 분석 완료 시 자동으로 화면(Step 2) 전환!
+                    st.session_state.step = 2
+                    st.rerun()
 
             except Exception as e:
                 st.error(f"분석 중 오류가 발생했습니다: {e}")
 
-with tab2:
-    st.header("🔍 AI 권리분석 상세 내역")
-    if st.session_state.analysis_done:
-        st.markdown("파이썬 엔진과 Gemini AI가 각 권리를 어떻게 판독했는지 보여줍니다.")
-        display_df = st.session_state.final_df[['구분', '순위번호', '등기목적', '접수일자_기준', '결과', 'AI_상세이유']]
-        st.dataframe(display_df, use_container_width=True)
-    else:
-        st.info("1단계 탭에서 사진을 업로드하고 분석을 시작해주세요.")
+# =====================================================================
+# 📑 [2단계 화면] 결과 및 다운로드 (자동으로 넘어오는 화면)
+# =====================================================================
+elif st.session_state.step == 2:
+    st.success("🎉 권리분석이 완벽하게 끝났습니다!")
+    
+    st.subheader("📑 법원 제출용: 말소할 등기 목록")
+    st.table(st.session_state.malso_df)
+    
+    # 워드 문서 자동 생성 로직
+    doc = Document()
+    doc.add_heading('말 소 할  등 기  목 록', level=1).alignment = WD_ALIGN_PARAGRAPH.CENTER
+    doc.add_paragraph()
 
-with tab3:
-    st.header("📑 법원 제출용 최종 서류 발급")
-    if st.session_state.analysis_done:
-        st.markdown("깔끔하게 정리된 **말소할 등기 목록**입니다. 아래 버튼을 눌러 워드 파일로 다운로드하세요.")
-        st.table(st.session_state.malso_df)
-        
-        # --- [워드 문서 생성 및 다운로드 버튼 (스트림릿 웹 방식)] ---
-        doc = Document()
-        doc.add_heading('말 소 할  등 기  목 록', level=1).alignment = WD_ALIGN_PARAGRAPH.CENTER
-        doc.add_paragraph()
+    for idx, row in st.session_state.malso_df.iterrows():
+        p = doc.add_paragraph()
+        p.add_run(f"{idx}. {row['구분']} 순위번호 제{row['순위번호']}번\n").bold = True
+        p.add_run(f"   {row['등기목적']}\n")
+        p.add_run(f"   {row['접수일자']} 접수")
 
-        for idx, row in st.session_state.malso_df.iterrows():
-            p = doc.add_paragraph()
-            p.add_run(f"{idx}. {row['구분']} 순위번호 제{row['순위번호']}번\n").bold = True
-            p.add_run(f"   {row['등기목적']}\n")
-            p.add_run(f"   {row['접수일자']} 접수")
+    doc_io = BytesIO()
+    doc.save(doc_io)
+    doc_io.seek(0)
+    
+    # 애플 스타일의 눈에 띄는 다운로드 버튼
+    st.download_button(
+        label="📥 워드 문서(.docx) 다운로드",
+        data=doc_io,
+        file_name="말소할_등기_목록.docx",
+        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        type="primary",
+        use_container_width=True
+    )
 
-        # 메모리 상에 가상의 파일(BytesIO)을 만들어서 저장
-        doc_io = BytesIO()
-        doc.save(doc_io)
-        doc_io.seek(0)
-        
-        st.download_button(
-            label="📄 워드 문서(.docx) 다운로드",
-            data=doc_io,
-            file_name="말소할_등기_목록.docx",
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            type="primary"
-        )
-    else:
-        st.info("1단계 탭에서 사진을 업로드하고 분석을 시작해주세요.")
+    st.markdown("---")
+    
+    # 전문가 확인용 상세 내역 박스
+    with st.expander("🤖 AI 상세 판독 내역 및 이유 보기 (클릭)", expanded=False):
+        st.dataframe(st.session_state.final_df[['구분', '순위번호', '등기목적', '결과', 'AI_상세이유']], use_container_width=True)
+    
+    # 초기화 및 재시작 버튼
+    if st.button("🔄 다른 등기부등본 분석하기", use_container_width=True):
+        st.session_state.step = 1
+        st.rerun()
