@@ -12,48 +12,64 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from io import BytesIO
 
 # =====================================================================
-# 🎨 1. 스트림릿 기본 설정 (모바일 최적화 & macOS 스타일 적용)
+# 🎨 1. 스트림릿 기본 설정 & 2030 타겟 감성 디자인 (CSS)
 # =====================================================================
-st.set_page_config(page_title="AI 말소할 등기 목록 추출기", page_icon="📜", layout="centered")
+st.set_page_config(page_title="AI 경매 권리분석 마법사", page_icon="🧙‍♂️", layout="centered")
 
 st.markdown("""
 <style>
-    /* 애플 시스템 폰트 및 전체 배경색 */
+    /* 트렌디한 Pretendard 폰트 적용 및 부드러운 배경색 */
+    @import url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard/dist/web/static/pretendard.css');
+    
     html, body, [class*="css"] {
-        font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Pretendard", Roboto, sans-serif;
+        font-family: 'Pretendard', -apple-system, sans-serif !important;
+        background-color: #FDFBF7; /* 따뜻한 아이보리 톤 */
+        color: #4A4A4A;
     }
     
-    /* 버튼 애플 스타일 (둥글고 부드러운 그림자) */
-    .stButton > button {
-        border-radius: 12px;
-        font-weight: 600;
+    /* 제목 및 텍스트 크기 조정 (너무 크지 않게) */
+    h1 { font-size: 26px !important; color: #333333; font-weight: 700; margin-bottom: 5px !important;}
+    h2, h3 { font-size: 20px !important; color: #4A4A4A; font-weight: 600; }
+    p, li, span { font-size: 15px !important; line-height: 1.6; }
+    
+    /* 코랄 핑크빛 둥근 메인 버튼 */
+    .stButton > button[kind="primary"] {
+        background-color: #FF9B9B;
+        color: white;
+        border-radius: 25px;
         border: none;
-        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-        transition: all 0.2s ease-in-out;
+        padding: 10px 20px;
+        font-size: 16px;
+        font-weight: 600;
+        box-shadow: 0 4px 10px rgba(255, 155, 155, 0.3);
+        transition: all 0.3s ease;
     }
-    .stButton > button:hover {
+    .stButton > button[kind="primary"]:hover {
+        background-color: #FF8282;
         transform: translateY(-2px);
-        box-shadow: 0 6px 12px rgba(0,0,0,0.15);
+        box-shadow: 0 6px 14px rgba(255, 155, 155, 0.4);
     }
-    
-    /* 파일 업로드 박스 디자인 */
+
+    /* 드래그앤드롭 업로드 박스 디자인 커스텀 (영어 텍스트 숨기기) */
     [data-testid="stFileUploadDropzone"] {
-        border-radius: 16px;
-        border: 2px dashed #007AFF;
-        background-color: #F2F2F7;
+        background-color: #FFFFFF;
+        border: 2px dashed #E0D4C3;
+        border-radius: 20px;
+        padding: 30px;
     }
+    [data-testid="stFileUploadDropzone"] div div::before {
+        content: '📸 터치해서 등기부등본 사진 올리기';
+        color: #A0968C;
+        font-size: 16px;
+        font-weight: 600;
+        display: block;
+        margin-bottom: 5px;
+    }
+    /* 기본 영어 텍스트 완벽 숨김 */
+    [data-testid="stFileUploadDropzone"] div div span { display: none !important; }
+    [data-testid="stFileUploadDropzone"] div div small { display: none !important; }
 </style>
 """, unsafe_allow_html=True)
-
-st.title("📜 AI 말소할 등기 목록 추출기")
-
-with st.expander("🚨 주의사항 및 개인정보 보호 안내 (클릭해서 확인)", expanded=False):
-    st.markdown("""
-    네이버 OCR과 Gemini AI를 활용하여 등기부등본에서 **'말소할 등기 목록'**을 자동으로 추출해 주는 보조 프로그램입니다.
-
-    * **[면책조항]** AI 판독 결과는 100% 완벽하지 않을 수 있으며, 복잡한 특약이나 예외 사항에 대해 오류가 발생할 수 있습니다. 본 프로그램의 결과는 참고용으로만 활용하시고, 실제 법원 제출 전 반드시 전문가의 검토를 거치시기 바랍니다.
-    * **[개인정보 보호 및 보안]** 업로드하신 등기부등본 사진은 서버에 일절 저장되지 않습니다. 권리분석이 완료되거나 브라우저를 닫으면 즉시 메모리에서 영구 삭제되므로 안심하고 사용하셔도 됩니다.
-    """)
 
 # =====================================================================
 # 🔑 2. API 키 자동 로드 (스트림릿 비밀 금고)
@@ -67,14 +83,14 @@ except KeyError:
     st.stop()
 
 # =====================================================================
-# 🧠 3. 지식 베이스 및 필터링 룰 (개발자님 작성 완벽본 전체)
+# 🧠 3. 지식 베이스 및 필터링 룰 (개발자님 작성 원본 100% 반영)
 # =====================================================================
 base_keywords = ['근저당', '저당', '담보물권', '가압류', '압류', '체납처분압류', '강제경매개시결정', '임의경매개시결정', '경매개시결정', '담보가등기']
 always_keep_keywords = ['건물철거', '토지인도', '법정지상권', '관습법상', '관습상', '분묘기지권', '예고등기', '요역지', '지역권', '도시철도법', '구분지상권', '채무자회생법', '특별매각조건', '인수조건']
 ai_check_keywords = ['전세권', '임차권', '가처분', '처분금지가처분', '가등기', '소유권이전청구권', '지상권', '부합물', '종물', '다른 약정', '특약']
 
-# 🌟 안내문 제거 필터
-ignore_keywords = ["관할등기소", "본등기사항증명서", "사법부내부", "열람용이므로", "법적인효력", "실선으로그어진", "말소사항을표시", "기록사항없는", "기록사항없음", "열람일시", "사법부 말소사항"]
+# 꼬리말 안내문 제거 필터
+ignore_keywords = ["관할등기소", "본등기사항증명서", "사법부내부", "열람용이므로", "법적인효력", "실선으로그어진", "말소사항을표시", "기록사항없는", "기록사항없음", "열람일시", "사법부 말소사항", "수원지방법원"]
 
 knowledge_base = """
 [업로드된 문서들을 바탕으로, 경매에서 **'말소기준권리'가 될 수 있는 모든 권리의 명칭(키워드)**을 쉼표로 구분해서 리스트 형태로 나열해 줘. (예: 근저당권, 가압류, 압류 등). 그리고 최선순위 전세권처럼 '특정 조건(배당요구 등)'이 충족되어야만 말소기준권리가 되는 예외적인 권리도 따로 명시해 줘.
@@ -165,7 +181,7 @@ knowledge_base = """
 • 대항력 있는 임차권: 최선순위 임차인이 배당요구를 하였더라도, 매각대금에서 보증금 전액을 배당(변제)받았는지 계산해야 합니다. 보증금이 모두 변제되지 않았다면 배당받지 못한 잔액이 매수인에게 그대로 인수되므로, 단순 날짜뿐만 아니라 배당표(변제 여부)에 대한 분석이 동반되어야 합니다.
 3. 등기 기록의 실질과 채권신고 여부를 따져야 하는 최선순위 '가등기'
 • 최선순위 가등기는 원칙적으로 매수인이 인수하는 '순위보전가등기'인지, 아니면 저당권처럼 매각으로 소멸하는 '담보가등기'인지 구분해야 합니다.
-• 등기기록의 내용만으로는 이를 명확히 단정할 수 단정할 수 없으며, 법원의 최고에 따라 가등기권자가 채권신고를 했는지의 여부 등 실질적인 내용을 보조적으로 파악해야 인수/말소를 판단할 수 있습니다.
+• 등기기록의 내용만으로는 이를 명확히 단정할 수 없으며, 법원의 최고에 따라 가등기권자가 채권신고를 했는지의 여부 등 실질적인 내용을 보조적으로 파악해야 인수/말소를 판단할 수 있습니다.
 4. 타 권리와의 종속 관계(부종성)를 파악해야 하는 '담보지상권'
 • 근저당권 등 담보권자가 목적물의 담보가치 하락을 막기 위해 저당권과 함께 설정해 두는 지상권을 '담보지상권'이라 합니다.
 • 일반적인 선순위 지상권은 인수되는 것이 원칙이지만, 이 담보지상권은 메인 권리인 '피담보채권(근저당권)'이 변제나 시효로 소멸하게 되면 그에 부종하여 함께 소멸하는 특성을 가집니다. 따라서 연관된 근저당권의 상태를 함께 분석해야 합니다.
@@ -239,11 +255,14 @@ if 'malso_df' not in st.session_state:
     st.session_state.malso_df = None
 
 # =====================================================================
-# 📱 [1단계 화면] 사진 업로드 및 판독 로직
+# 📱 [1단계 화면] 메인 화면 및 사진 업로드
 # =====================================================================
 if st.session_state.step == 1:
-    st.subheader("📸 1. 문서 업로드")
-    uploaded_files = st.file_uploader("등기부등본 사진(JPG, PNG)을 모두 올려주세요", accept_multiple_files=True, type=['jpg', 'jpeg', 'png'])
+    st.title("🧙‍♂️ AI 경매 권리분석 마법사")
+    st.markdown("스마트폰으로 등기부등본을 찍어 올리면, AI가 자동으로 권리를 분석해 줍니다.")
+    
+    # 드래그앤드롭 텍스트가 CSS로 숨겨진 깔끔한 업로드 창
+    uploaded_files = st.file_uploader(" ", accept_multiple_files=True, type=['jpg', 'jpeg', 'png'], label_visibility="collapsed")
 
     if st.button("🚀 권리분석 시작", type="primary", use_container_width=True):
         if not uploaded_files:
@@ -253,7 +272,7 @@ if st.session_state.step == 1:
                 genai.configure(api_key=GEMINI_API_KEY)
                 model = genai.GenerativeModel('gemini-2.5-flash')
                 
-                with st.spinner('네이버 AI가 문서를 스캔 중입니다... (약 10~20초)'):
+                with st.spinner('문서를 스캔하고 있습니다... (약 10~20초)'):
                     all_clean_rows = []
                     for file in sorted(uploaded_files, key=lambda x: x.name):
                         file_bytes = file.getvalue()
@@ -290,7 +309,7 @@ if st.session_state.step == 1:
                             st.error("OCR 스캔 중 오류가 발생했습니다.")
                             st.stop()
 
-                with st.spinner('파이썬 엔진이 기초 권리를 분석 중입니다...'):
+                with st.spinner('파이썬 엔진이 권리를 분류하고 있습니다...'):
                     records, current_record, current_gu = [], {}, None
                     rank_pattern = re.compile(r'^([1-9]\d*[-]?\d*)(?:\s+|번|(?=[가-힣]))') 
                     date_pattern = re.compile(r'(\d{4})년\s*(\d{1,2})월\s*(\d{1,2})일')
@@ -298,7 +317,7 @@ if st.session_state.step == 1:
                     for row in all_clean_rows:
                         clean_row = row.replace(" ", "")
                         
-                        # 🌟 꼬리말 필터 적용: 쓸데없는 안내문 쓰레기통으로!
+                        # 🌟 꼬리말 필터: 쓸데없는 안내문 쓰레기통으로!
                         if any(kw in clean_row for kw in ignore_keywords):
                             continue
                             
@@ -308,14 +327,27 @@ if st.session_state.step == 1:
 
                         match = rank_pattern.match(row)
                         is_new_record = False
-                        if match and not row[match.end():].strip().startswith(('호', '동', '층', '길', '번지', 'm', '㎡', '전')):
-                            is_new_record = True
+                        
+                        if match:
+                            rank_str = match.group(1)
+                            rest_of_line = row[match.end():].strip()
+                            
+                            # 🌟 가짜 순위번호 방지 3중 철통 방어 필터 (2022년, 277-2 등 방지)
+                            if "-" in rank_str: 
+                                pass # 277-2 같은 바코드/지번 번호 패스
+                            elif len(rank_str) >= 4 or int(rank_str) > 200: 
+                                pass # 2022, 2024 같은 연도 패스
+                            elif rest_of_line.startswith(('호', '동', '층', '길', '번지', 'm', '㎡', '전', '년', '월', '일')):
+                                pass # 주소나 날짜로 이어지는 경우 패스
+                            else:
+                                is_new_record = True # 진짜 순위번호일 때만 새 기록 생성!
 
                         if is_new_record: 
                             if current_record: records.append(current_record)
-                            current_record = {'구분': current_gu, '순위번호': match.group(1), '전체내용': row}
+                            current_record = {'구분': current_gu, '순위번호': rank_str, '전체내용': row}
                         else: 
                             if current_record: current_record['전체내용'] += " " + row
+                    
                     if current_record: records.append(current_record)
 
                     parsed_records = []
@@ -385,23 +417,32 @@ if st.session_state.step == 1:
                     st.session_state.final_df = df
                     st.session_state.malso_df = malso_df
                     
-                    # 🌟 모든 분석 완료 시 자동으로 화면(Step 2) 전환!
+                    # 🌟 모든 분석 완료 시 2단계 화면으로 자동 전환
                     st.session_state.step = 2
                     st.rerun()
 
             except Exception as e:
                 st.error(f"분석 중 오류가 발생했습니다: {e}")
 
+    st.markdown("<br>", unsafe_allow_html=True)
+    
+    # 주의사항을 버튼 밑으로 이동
+    with st.expander("🚨 주의사항 및 개인정보 보호 안내 (클릭해서 확인)"):
+        st.markdown("""
+        * **[면책조항]** AI 판독 결과는 100% 완벽하지 않을 수 있으며, 복잡한 특약에 대해 오류가 발생할 수 있습니다. 본 결과는 참고용으로만 활용하시고, 실제 법원 제출 전 반드시 전문가의 검토를 거치시기 바랍니다.
+        * **[개인정보 보호]** 업로드하신 사진은 서버에 일절 저장되지 않습니다. 권리분석 완료 후 즉시 메모리에서 영구 삭제됩니다.
+        """)
+
 # =====================================================================
-# 📑 [2단계 화면] 결과 및 다운로드 (자동으로 넘어오는 화면)
+# 📑 [2단계 화면] 결과 및 다운로드
 # =====================================================================
 elif st.session_state.step == 2:
-    st.success("🎉 권리분석이 완벽하게 끝났습니다!")
+    st.title("✨ 분석이 완료되었습니다!")
     
     st.subheader("📑 법원 제출용: 말소할 등기 목록")
     st.table(st.session_state.malso_df)
     
-    # 워드 문서 자동 생성 로직
+    # 워드 문서 자동 생성
     doc = Document()
     doc.add_heading('말 소 할  등 기  목 록', level=1).alignment = WD_ALIGN_PARAGRAPH.CENTER
     doc.add_paragraph()
@@ -416,7 +457,6 @@ elif st.session_state.step == 2:
     doc.save(doc_io)
     doc_io.seek(0)
     
-    # 애플 스타일의 눈에 띄는 다운로드 버튼
     st.download_button(
         label="📥 워드 문서(.docx) 다운로드",
         data=doc_io,
@@ -426,13 +466,13 @@ elif st.session_state.step == 2:
         use_container_width=True
     )
 
-    st.markdown("---")
+    st.markdown("<br><hr><br>", unsafe_allow_html=True)
     
-    # 전문가 확인용 상세 내역 박스
-    with st.expander("🤖 AI 상세 판독 내역 및 이유 보기 (클릭)", expanded=False):
+    with st.expander("🤖 AI 상세 판독 내역 및 이유 보기 (클릭)"):
         st.dataframe(st.session_state.final_df[['구분', '순위번호', '등기목적', '결과', 'AI_상세이유']], use_container_width=True)
     
-    # 초기화 및 재시작 버튼
-    if st.button("🔄 다른 등기부등본 분석하기", use_container_width=True):
+    st.markdown("<br>", unsafe_allow_html=True)
+    
+    if st.button("🔄 처음으로 돌아가기", use_container_width=True):
         st.session_state.step = 1
         st.rerun()
