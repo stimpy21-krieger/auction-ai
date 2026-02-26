@@ -283,7 +283,7 @@ if 'malso_df' not in st.session_state:
 # =====================================================================
 if st.session_state.step == 1:
     st.title("🧙‍♂️ AI 경매 권리분석 마법사")
-    st.markdown("스마트폰으로 등기부등본을 찍어 올리면, AI가 자동으로 권리를 분석해 줍니다.")
+    st.markdown("스마트폰으로 등기부등본 사진을 찍어서 올리면, AI가 자동으로 권리를 분석해 줍니다.")
     
     # CSS로 영어 문구가 완벽히 숨겨진 업로드 창
     uploaded_files = st.file_uploader(" ", accept_multiple_files=True, type=['jpg', 'jpeg', 'png'], label_visibility="collapsed")
