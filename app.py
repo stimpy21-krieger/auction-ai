@@ -60,23 +60,10 @@ st.markdown("""
         padding: 30px !important;
     }
 
-    /* Browse files 버튼 글자 투명 + 한글 오버레이 */
+    /* Browse files 버튼 — JS MutationObserver가 텍스트를 치환하므로 CSS ::after 불필요 */
     [data-testid="stFileUploadDropzone"] button {
-        color: transparent !important;
-        position: relative !important;
-    }
-    [data-testid="stFileUploadDropzone"] button::after {
-        content: "사진 선택하기" !important;
-        color: #4A4A4A !important;
-        position: absolute !important;
-        top: 50% !important;
-        left: 50% !important;
-        transform: translate(-50%, -50%) !important;
         font-weight: 600 !important;
         font-size: 14px !important;
-        visibility: visible !important;
-        width: 100% !important;
-        text-align: center !important;
     }
 </style>
 
@@ -130,9 +117,10 @@ st.markdown("""
 # =====================================================================
 def preprocess_image(file_bytes):
     """스마트폰으로 찍은 사진의 OCR 인식률을 향상시키기 위한 전처리 파이프라인.
+    등기부등본 등 법률 문서에 최적화: 이진화 대신 대조도(CLAHE) + 선명도(Sharpening)만 적용.
     1) 그레이스케일 변환
-    2) 가우시안 블러로 미세 노이즈 제거
-    3) 적응형 이진화(Adaptive Threshold)로 그림자/조명 편차 제거
+    2) CLAHE(대조도 향상)로 그림자/조명 편차 균일화
+    3) 언샤프 마스크(Sharpening)로 글자 선명도 향상
     4) 기울기 보정(deskew)으로 수평 맞춤
     5) PNG 바이트로 재인코딩
     """
@@ -145,20 +133,18 @@ def preprocess_image(file_bytes):
     # 1) 그레이스케일
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    # 2) 가우시안 블러 (커널 3x3)
-    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+    # 2) CLAHE (대조도 향상) — 이진화보다 부드럽게 그림자/조명 보정
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
 
-    # 3) 적응형 이진화 — 그림자가 져도 텍스트가 선명하게
-    thresh = cv2.adaptiveThreshold(
-        blurred, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        blockSize=15,
-        C=10
-    )
+    # 3) 언샤프 마스크 (선명도 향상) — 글자 경계를 또렷하게
+    blurred = cv2.GaussianBlur(enhanced, (0, 0), 3)
+    sharpened = cv2.addWeighted(enhanced, 1.5, blurred, -0.5, 0)
 
     # 4) 기울기 보정 (deskew)
-    coords = np.column_stack(np.where(thresh < 255))  # 검은 픽셀 좌표
+    # 이진화는 기울기 감지용으로만 임시 사용 (최종 출력에는 미적용)
+    _, temp_thresh = cv2.threshold(sharpened, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    coords = np.column_stack(np.where(temp_thresh > 0))  # 글자 픽셀 좌표
     if len(coords) > 100:  # 충분한 텍스트 픽셀이 있을 때만
         angle = cv2.minAreaRect(coords)[-1]
         # minAreaRect 각도 보정: -90~0 범위를 실제 기울기로 변환
@@ -168,17 +154,17 @@ def preprocess_image(file_bytes):
             angle = -angle
         # 5도 이내의 기울기만 보정 (과보정 방지)
         if abs(angle) > 0.3 and abs(angle) < 5:
-            (h, w) = thresh.shape
+            (h, w) = sharpened.shape
             center = (w // 2, h // 2)
             M = cv2.getRotationMatrix2D(center, angle, 1.0)
-            thresh = cv2.warpAffine(
-                thresh, M, (w, h),
+            sharpened = cv2.warpAffine(
+                sharpened, M, (w, h),
                 flags=cv2.INTER_CUBIC,
                 borderMode=cv2.BORDER_REPLICATE
             )
 
     # 5) PNG 바이트로 인코딩
-    _, encoded = cv2.imencode('.png', thresh)
+    _, encoded = cv2.imencode('.png', sharpened)
     return encoded.tobytes()
 
 # =====================================================================
@@ -368,13 +354,41 @@ knowledge_base = """
 # =====================================================================
 # 📋 문서 분류 및 명세서 분석 함수
 # =====================================================================
-def classify_document(ocr_text):
-    """OCR 텍스트를 기반으로 등기부등본 vs 매각물건명세서 자동 판별"""
+def classify_document(ocr_text, use_title_only=False):
+    """OCR 텍스트를 기반으로 등기부등본 vs 매각물건명세서 자동 판별.
+    use_title_only=True: 문서 제목(상위 5행)만으로 판별 (더 정확)
+    """
     clean = ocr_text.replace(" ", "")
+    
+    # 제목 영역 판별 (상위 5행 = 문서 제목 부분)
+    if use_title_only:
+        lines = ocr_text.strip().split("\n")
+        title_area = " ".join(lines[:5]).replace(" ", "") if lines else clean
+    else:
+        title_area = clean
+    
+    # 제목 영역에서 강력 키워드 우선 검사
+    title_spec_keywords = ["매각물건명세서", "매각물건의표시"]
+    title_reg_keywords = ["등기사항전부증명서", "등기사항증명서", "등기부등본", "표제부"]
+    
+    for kw in title_spec_keywords:
+        if kw in title_area:
+            return "매각물건명세서"
+    for kw in title_reg_keywords:
+        if kw in title_area:
+            return "등기부등본"
+    
+    # 전체 텍스트 스코어링 (fallback)
     spec_score = sum(1 for kw in spec_keywords if kw in clean)
     reg_score = sum(1 for kw in registry_keywords if kw in clean)
+    # "갑구", "을구"는 명세서에도 등장할 수 있으므로 가중치 낮춤
+    weak_reg_keywords = ["갑구", "을구"]
+    strong_reg_count = sum(1 for kw in registry_keywords if kw not in weak_reg_keywords and kw in clean)
+    
     if spec_score >= 2:
         return "매각물건명세서"
+    if strong_reg_count >= 1:
+        return "등기부등본"
     if reg_score >= 1:
         return "등기부등본"
     # 기본값: 등기부등본 (기존 호환성)
@@ -581,7 +595,7 @@ if st.session_state.step == 1:
                             # 캐시에 없으면 전체에서 추정 (fallback)
                             file_rows = all_clean_rows[offset:]
                         file_text = " ".join(file_rows)
-                        file_type = classify_document(file_text)
+                        file_type = classify_document(file_text, use_title_only=True)
                         if file_type == "매각물건명세서":
                             temp_spec.extend(file_rows)
                         else:
@@ -668,7 +682,9 @@ if st.session_state.step == 1:
                             rec['접수일자_표시'] = f"{y}년 {m}월 {d}일" + (f" 제{receipt_match.group(1)}호" if receipt_match else "")
                             
                             raw_target = rec['전체내용'][:date_match.start()].replace(rec['순위번호'], '', 1).strip()
-                            clean_target = re.sub(r'^번\s*|(가압|임의|강제|전부|근저당권|압류|경매개시결정)$', '', raw_target).strip()
+                            # 등기목적 키워드를 완전한 형태로 제거 (중복 방지)
+                            action_strip_pattern = r'^번\s*|(?:전부)?근저당권설정$|가압류$|임의경매개시결정$|강제경매개시결정$|압류$|경매개시결정$'
+                            clean_target = re.sub(action_strip_pattern, '', raw_target).strip()
                             
                             action = ""
                             if '임의경매개시결정' in content: action = "임의경매개시결정"
@@ -676,7 +692,11 @@ if st.session_state.step == 1:
                             elif '가압류' in content: action = "가압류"
                             elif '근저당권설정' in content: action = "전부근저당권설정" if '전부근저당권설정' in content else "근저당권설정"
                             elif '압류' in content: action = "압류"
-                            rec['등기목적'] = f"{clean_target} {action}".strip()
+                            # ✅ 중복 방지: clean_target에 이미 action이 포함되어 있으면 action 추가 안 함
+                            if action and action in clean_target:
+                                rec['등기목적'] = clean_target
+                            else:
+                                rec['등기목적'] = f"{clean_target} {action}".strip()
                         else:
                             rec['접수일자_표시'], rec['등기목적'] = "확인불가", "확인불가"
 
@@ -684,6 +704,18 @@ if st.session_state.step == 1:
                         rec['절대인수'] = any(kw in content for kw in always_keep_keywords)
                         rec['AI해석필요'] = any(kw in content for kw in ai_check_keywords)
                         rec['소유권이전'] = '이전' in content and not rec['말소후보'] and not rec['절대인수']
+                        
+                        # 📝 접수번호 OCR 오타 감지: '제XXXX호' 패턴 검증
+                        receipt_match = re.search(r'제\s*(\d+)\s*호', rec['전체내용'])
+                        rec['접수번호_오타'] = ""
+                        if receipt_match:
+                            receipt_num = receipt_match.group(1)
+                            # 비정상적 접수번호 감지 (자릿수 1자리 이하이거나 8자리 이상)
+                            if len(receipt_num) <= 1 or len(receipt_num) >= 8:
+                                rec['접수번호_오타'] = f"⚠️ 접수번호 '{receipt_num}'이(가) 패턴상 오타로 보입니다. 원본 확인 필요."
+                        elif rec.get('접수일자_표시', '') != '확인불가' and '제' not in rec['전체내용']:
+                            rec['접수번호_오타'] = "⚠️ 접수번호(제____호)가 인식되지 않았습니다. 원본 확인 필요."
+                        
                         parsed_records.append(rec)
 
                     df = pd.DataFrame(parsed_records)
@@ -786,7 +818,17 @@ elif st.session_state.step == 2:
     st.markdown("<br><hr><br>", unsafe_allow_html=True)
     
     with st.expander("🤖 AI 상세 판독 내역 및 이유 보기 (클릭)"):
-        st.dataframe(st.session_state.final_df[['구분', '순위번호', '등기목적', '결과', 'AI_상세이유']], use_container_width=True)
+        display_cols = ['구분', '순위번호', '등기목적', '결과', 'AI_상세이유']
+        st.dataframe(st.session_state.final_df[display_cols], use_container_width=True)
+        
+        # 📝 접수번호 OCR 오타 경고 표시
+        if '접수번호_오타' in st.session_state.final_df.columns:
+            typo_rows = st.session_state.final_df[st.session_state.final_df['접수번호_오타'] != ''].copy()
+            if not typo_rows.empty:
+                st.markdown("---")
+                st.markdown("**📝 접수번호 OCR 오타 감지 결과**")
+                for _, row in typo_rows.iterrows():
+                    st.warning(f"순위번호 {row['순위번호']}번: {row['접수번호_오타']}")
     
     st.markdown("<br>", unsafe_allow_html=True)
     
