@@ -50,24 +50,48 @@ st.markdown("""
         box-shadow: 0 6px 14px rgba(255, 155, 155, 0.4);
     }
 
-    /* 드래그앤드롭 업로드 박스 디자인 커스텀 (영어 텍스트 숨기기) */
+    /* 파일 업로드 창 커스텀 (영어 텍스트 완벽 한글화 및 숨김) */
     [data-testid="stFileUploadDropzone"] {
         background-color: #FFFFFF;
-        border: 2px dashed #E0D4C3;
+        border: 2px dashed #FF9B9B;
         border-radius: 20px;
         padding: 30px;
     }
-    [data-testid="stFileUploadDropzone"] div div::before {
+    
+    /* 기본 "Drag and drop files here" 및 "Limit 200MB..." 숨기기 */
+    [data-testid="stFileUploadDropzone"] > div > div > span,
+    [data-testid="stFileUploadDropzone"] > div > div > small {
+        display: none !important;
+    }
+    
+    /* 새로운 한글 안내 문구 삽입 */
+    [data-testid="stFileUploadDropzone"] > div > div::before {
         content: '📸 터치해서 등기부등본 사진 올리기';
         color: #A0968C;
         font-size: 16px;
         font-weight: 600;
         display: block;
-        margin-bottom: 5px;
+        margin-bottom: 15px;
     }
-    /* 기본 영어 텍스트 완벽 숨김 */
-    [data-testid="stFileUploadDropzone"] div div span { display: none !important; }
-    [data-testid="stFileUploadDropzone"] div div small { display: none !important; }
+
+    /* "Browse files" 버튼 텍스트 변경을 위한 CSS 해킹 */
+    [data-testid="stFileUploadDropzone"] button {
+        color: transparent !important;
+        border-color: #E0D4C3 !important;
+        background-color: white !important;
+        position: relative;
+    }
+    [data-testid="stFileUploadDropzone"] button::after {
+        content: "사진 선택하기";
+        color: #4A4A4A !important;
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        font-weight: 600;
+        font-size: 14px;
+        visibility: visible;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -261,7 +285,7 @@ if st.session_state.step == 1:
     st.title("🧙‍♂️ AI 경매 권리분석 마법사")
     st.markdown("스마트폰으로 등기부등본을 찍어 올리면, AI가 자동으로 권리를 분석해 줍니다.")
     
-    # 드래그앤드롭 텍스트가 CSS로 숨겨진 깔끔한 업로드 창
+    # CSS로 영어 문구가 완벽히 숨겨진 업로드 창
     uploaded_files = st.file_uploader(" ", accept_multiple_files=True, type=['jpg', 'jpeg', 'png'], label_visibility="collapsed")
 
     if st.button("🚀 권리분석 시작", type="primary", use_container_width=True):
@@ -426,10 +450,10 @@ if st.session_state.step == 1:
 
     st.markdown("<br>", unsafe_allow_html=True)
     
-    # 주의사항을 버튼 밑으로 이동
+    # 수정된 주의사항 텍스트
     with st.expander("🚨 주의사항 및 개인정보 보호 안내 (클릭해서 확인)"):
         st.markdown("""
-        * **[면책조항]** AI 판독 결과는 100% 완벽하지 않을 수 있으며, 복잡한 특약에 대해 오류가 발생할 수 있습니다. 본 결과는 참고용으로만 활용하시고, 실제 법원 제출 전 반드시 전문가의 검토를 거치시기 바랍니다.
+        * **[면책조항]** AI 판독 결과는 100% 완벽하지 않을 수 있으며, 오류가 발생할 수 있습니다. 본 결과는 참고용으로만 활용하시기 바랍니다.
         * **[개인정보 보호]** 업로드하신 사진은 서버에 일절 저장되지 않습니다. 권리분석 완료 후 즉시 메모리에서 영구 삭제됩니다.
         """)
 
