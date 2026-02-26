@@ -12,23 +12,35 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from io import BytesIO
 
 # =====================================================================
-# 🎨 1. 스트림릿 기본 설정 (웹 페이지 레이아웃)
+# 🎨 1. 스트림릿 기본 설정 & 타이틀 변경
 # =====================================================================
-st.set_page_config(page_title="AI 경매 권리분석 마법사", page_icon="🧙‍♂️", layout="wide")
-st.title("🧙‍♂️ AI 경매 권리분석 마법사")
-st.markdown("네이버 OCR과 Gemini AI를 활용하여 등기부등본의 권리를 완벽하게 분석합니다.")
+st.set_page_config(page_title="AI 말소할 등기 목록 추출기", page_icon="📜", layout="wide")
+st.title("📜 AI 말소할 등기 목록 추출기")
+
+st.markdown("""
+네이버 OCR과 Gemini AI를 활용하여 등기부등본에서 **'말소할 등기 목록'**을 자동으로 추출해 주는 보조 프로그램입니다.
+
+🚨 **[주의사항 및 면책조항]**
+* AI의 판독 결과는 100% 완벽하지 않을 수 있으며, 복잡한 특약이나 예외 사항에 대해 오류가 발생할 수 있습니다.
+* 본 프로그램의 결과는 **참고용**으로만 활용하시고, 실제 법원 제출 및 입찰 전에는 반드시 **전문가의 최종 검토**를 거치시기 바랍니다.
+
+🔒 **[개인정보 보호 및 보안]**
+* 업로드하신 등기부등본 사진은 서버에 일절 저장되지 않습니다.
+* 권리분석이 완료되거나 브라우저를 닫으면 업로드된 자료는 즉시 메모리에서 영구 삭제되므로 안심하고 사용하셔도 됩니다.
+""")
+st.markdown("---")
 
 # =====================================================================
-# 🔑 2. API 키 설정 (보안을 위해 사이드바에 입력란 생성)
+# 🔑 2. API 키 자동 로드 (스트림릿 비밀 금고에서 가져오기)
 # =====================================================================
-with st.sidebar:
-    st.header("🔑 API 키 설정")
-    st.markdown("최초 1회만 입력하시면 됩니다.")
-    NAVER_API_URL = st.text_input("Naver OCR API URL", type="password")
-    NAVER_SECRET_KEY = st.text_input("Naver OCR Secret Key", type="password")
-    GEMINI_API_KEY = st.text_input("Gemini API Key", type="password")
-    st.markdown("---")
-    st.info("※ API 키는 서버에 저장되지 않으며, 현재 창을 닫으면 초기화됩니다.")
+# 이제 왼쪽 사이드바 입력창은 사라지고, 서버에서 알아서 키를 꺼내옵니다.
+try:
+    NAVER_API_URL = st.secrets["NAVER_API_URL"]
+    NAVER_SECRET_KEY = st.secrets["NAVER_SECRET_KEY"]
+    GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
+except KeyError:
+    st.error("앗! 서버의 비밀 금고(Secrets)에 API 키가 설정되지 않았습니다. 관리자 설정이 필요합니다.")
+    st.stop()
 
 # =====================================================================
 # 🧠 3. 지식 베이스 및 AI 룰 (개발자님 작성 완벽본)
