@@ -1146,6 +1146,7 @@ elif st.session_state.step == 2:
         timeline_df = st.session_state.final_df.dropna(subset=['접수일자_기준']).copy()
         if not timeline_df.empty:
             with st.expander("📊 권리 타임라인 시각화", expanded=True):
+              try:
                 # 색상 매핑
                 color_map = {
                     '인수': '#2ecc71',
@@ -1167,13 +1168,15 @@ elif st.session_state.step == 2:
                 timeline_df['색상'] = timeline_df['결과'].apply(get_color)
                 # 구분을 숫자로 (갑구=1, 을구=2)
                 timeline_df['Y축'] = timeline_df['구분'].apply(lambda x: 1 if '갑' in x else 2)
+                # datetime.date → 문자열 변환 (Plotly 호환)
+                timeline_df['날짜_str'] = timeline_df['접수일자_기준'].apply(lambda d: d.isoformat() if d else None)
 
                 fig = go.Figure()
 
                 # 등기 포인트
                 for _, row in timeline_df.iterrows():
                     fig.add_trace(go.Scatter(
-                        x=[row['접수일자_기준']],
+                        x=[row['날짜_str']],
                         y=[row['Y축']],
                         mode='markers+text',
                         marker=dict(size=14, color=row['색상'], line=dict(width=1, color='white')),
@@ -1185,14 +1188,21 @@ elif st.session_state.step == 2:
                         showlegend=False,
                     ))
 
-                # 말소기준권리 수직선
+                # 말소기준권리 수직선 (add_shape + add_annotation으로 대체 — add_vline은 date 객체 버그 있음)
                 if st.session_state.base_date_info:
                     bd = st.session_state.base_date_info['date']
-                    fig.add_vline(
-                        x=bd, line_dash='dash', line_color='red', line_width=2,
-                        annotation_text='📌 말소기준권리',
-                        annotation_position='top',
-                        annotation_font_color='red',
+                    bd_str = bd.isoformat() if hasattr(bd, 'isoformat') else str(bd)
+                    fig.add_shape(
+                        type='line',
+                        x0=bd_str, x1=bd_str, y0=0.5, y1=2.5,
+                        line=dict(color='red', width=2, dash='dash'),
+                    )
+                    fig.add_annotation(
+                        x=bd_str, y=2.5,
+                        text='📌 말소기준권리',
+                        showarrow=False,
+                        font=dict(color='red', size=11),
+                        yshift=10,
                     )
 
                 # 범례 (더미 트레이스)
@@ -1219,6 +1229,8 @@ elif st.session_state.step == 2:
                     plot_bgcolor='rgba(253,251,247,1)',
                 )
                 st.plotly_chart(fig, use_container_width=True)
+              except Exception as chart_err:
+                st.warning(f"⚠️ 타임라인 차트 표시 중 오류: {chart_err}")
             st.markdown("<br>", unsafe_allow_html=True)
 
     # 🚨 매각물건명세서 위험 경고 (최상단에 표시)
