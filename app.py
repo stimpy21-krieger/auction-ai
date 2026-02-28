@@ -699,8 +699,6 @@ if 'danger_warnings' not in st.session_state:
     st.session_state.danger_warnings = []  # 🚨 위험 경고 목록
 if 'base_date_info' not in st.session_state:
     st.session_state.base_date_info = None  # 📅 말소기준권리 상세 정보
-if 'compression_log' not in st.session_state:
-    st.session_state.compression_log = []  # 📦 이미지 압축 로그
 if 'safety_report' not in st.session_state:
     st.session_state.safety_report = None  # 🧾 종합 안전도 리포트
 
@@ -732,8 +730,7 @@ if st.session_state.step == 1:
                 cache_hit_count = 0
                 total_files = len(uploaded_files)
                 sorted_files = sorted(uploaded_files, key=natural_sort_key)
-                compression_log = []
-                progress_bar = st.progress(0, text='📸 문서 스캔 준비 중...')
+                progress_bar = st.progress(0, text='📸 분석 준비 중...')
 
                 for file_idx, file in enumerate(sorted_files):
                     raw_bytes = file.getvalue()
@@ -746,28 +743,22 @@ if st.session_state.step == 1:
                         cache_hit_count += 1
                         continue
 
-                    progress_bar.progress((file_idx) / total_files, text=f'📸 스캔 중 ({file_idx + 1}/{total_files}): {file.name}')
+                    progress_bar.progress((file_idx) / total_files, text=f'📸 분석 중 ({file_idx + 1}/{total_files}): {file.name}')
 
-                    # 📦 Step 1: Pillow로 이미지 압축 (1500px, JPEG Q80)
-                    compressed_bytes = compress_and_preprocess(raw_bytes)
-                    original_kb = len(raw_bytes) / 1024
-                    compressed_kb = len(compressed_bytes) / 1024
-                    if original_kb > 500:
-                        compression_log.append(
-                            f"📦 {file.name}: {original_kb/1024:.1f}MB → {compressed_kb/1024:.1f}MB ({(1 - compressed_kb/original_kb)*100:.0f}% 절감)"
-                        )
+                    # � 원본 사진 그대로 네이버 OCR에 전송 (전처리 제거 — API가 원본 컬러 사진을 더 잘 인식)
+                    file_ext = file.name.rsplit('.', 1)[-1].lower() if '.' in file.name else 'jpg'
+                    mime_map = {'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'png': 'image/png'}
+                    file_mime = mime_map.get(file_ext, 'image/jpeg')
+                    file_format = 'png' if file_ext == 'png' else 'jpg'
 
-                    # 🖼️ Step 2: OpenCV로 OCR 전처리
-                    file_bytes = preprocess_image(compressed_bytes)
-                    request_json = {'images': [{'format': 'png', 'name': 'demo'}], 'requestId': str(uuid.uuid4()), 'version': 'V2', 'timestamp': int(round(time.time() * 1000))}
+                    request_json = {'images': [{'format': file_format, 'name': 'demo'}], 'requestId': str(uuid.uuid4()), 'version': 'V2', 'timestamp': int(round(time.time() * 1000))}
                     payload = {'message': json.dumps(request_json).encode('UTF-8')}
                     headers = {'X-OCR-SECRET': NAVER_SECRET_KEY}
 
                     # 🔄 네이버 OCR API 호출 (timeout 30초 + 재시도 2회)
                     response = None
                     for attempt in range(3):
-                        # Bug 5 fix: 매 시도마다 file_data 재생성 (read pointer 리셋)
-                        file_data = [('file', (file.name, file_bytes, 'image/png'))]
+                        file_data = [('file', (file.name, raw_bytes, file_mime))]
                         try:
                             response = requests.post(
                                 NAVER_API_URL, headers=headers, data=payload,
@@ -824,13 +815,10 @@ if st.session_state.step == 1:
                         st.error(f"OCR 스캔 실패 ({file.name}): HTTP {status}")
                         st.stop()
 
-                progress_bar.progress(1.0, text='✅ OCR 스캔 완료!')
-                st.session_state.compression_log = compression_log
+                progress_bar.progress(1.0, text='✅ 분석 완료!')
 
                 if cache_hit_count > 0:
-                    st.toast(f'💰 {cache_hit_count}개 파일은 이전 스캔 결과를 재사용했습니다 (부분 재분석 · 비용 절감!)')
-                for log_msg in compression_log:
-                    st.toast(log_msg)
+                    st.toast(f'💰 {cache_hit_count}개 파일은 이전 분석 결과를 재사용했습니다 (부분 재분석 · 비용 절감!)')
 
 
                 # 📷 Feature C: 여러 장 등기부 페이지 연결 — 갑구/을구 자동 정렬
@@ -1355,7 +1343,7 @@ elif st.session_state.step == 2:
     if st.button("🔄 처음으로 돌아가기", use_container_width=True):
         # 🔄 전체 세션 상태 초기화 (이전 결과 혼합 방지)
         for key in ['final_df', 'malso_df', 'spec_summary', 'danger_warnings',
-                     'malso_omission_report', 'base_date_info', 'compression_log', 'safety_report']:
+                     'malso_omission_report', 'base_date_info', 'safety_report']:
             if key in st.session_state:
                 del st.session_state[key]
         st.session_state.step = 1
