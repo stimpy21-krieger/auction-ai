@@ -116,105 +116,153 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # =====================================================================
-# � 이미지 자동 압축 함수 (Pillow) — 8MB+ 고해상도 사진 메모리 오류 방지
+# 🖼️ 스마트 이미지 전처리 (Grayscale + CLAHE + Deskew)
 # =====================================================================
-def compress_and_preprocess(file_bytes, max_width=1500, jpeg_quality=80):
-    """Pillow를 사용하여 고해상도 이미지를 압축합니다.
-    1) 너비가 max_width(기본 1500px)을 초과하면 비율 유지 리사이징
-    2) JPEG 품질 jpeg_quality(기본 80)로 압축
-    3) EXIF 회전 정보 자동 적용 (스마트폰 사진 대응)
-    → 압축된 JPEG 바이트를 반환하여 네이버 OCR로 전송
+def smart_preprocess(file_bytes):
+    """스마트폰 사진을 OCR 최적화 전처리합니다.
+    - 해상도 유지 (resize 없음)
+    - Grayscale + CLAHE 대비 향상 → 용량 축소 + 선명도 향상
+    - Hough Line Transform 기반 deskew → 기울어진 문서 자동 수평 보정
+    - PNG 무손실 출력
     """
     try:
-        img = Image.open(BytesIO(file_bytes))
-
-        # EXIF 회전 정보 자동 적용 (스마트폰으로 찍은 사진의 방향 보정)
+        # EXIF 회전 보정 (스마트폰 방향)
         try:
             from PIL import ImageOps
-            img = ImageOps.exif_transpose(img)
+            pil_img = Image.open(BytesIO(file_bytes))
+            pil_img = ImageOps.exif_transpose(pil_img)
+            buf = BytesIO()
+            pil_img.save(buf, format='PNG')
+            file_bytes = buf.getvalue()
         except Exception:
-            pass  # EXIF 정보가 없거나 처리 실패 시 무시
+            pass
 
-        # 너비가 max_width를 초과하면 비율 유지 리사이징
-        if img.width > max_width:
-            ratio = max_width / img.width
-            new_height = int(img.height * ratio)
-            img = img.resize((max_width, new_height), Image.LANCZOS)
+        # 바이트 → OpenCV
+        nparr = np.frombuffer(file_bytes, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if img is None:
+            return file_bytes, 'png'
 
-        # RGBA → RGB 변환 (JPEG는 알파 채널 미지원)
-        if img.mode in ('RGBA', 'P', 'LA'):
-            background = Image.new('RGB', img.size, (255, 255, 255))
-            if img.mode == 'P':
-                img = img.convert('RGBA')
-            background.paste(img, mask=img.split()[-1] if 'A' in img.mode else None)
-            img = background
-        elif img.mode != 'RGB':
-            img = img.convert('RGB')
+        # 1) Grayscale
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-        # JPEG 품질 80으로 압축
-        buffer = BytesIO()
-        img.save(buffer, format='JPEG', quality=jpeg_quality, optimize=True)
-        compressed_bytes = buffer.getvalue()
+        # 2) CLAHE 대비 향상 (그림자/조명 보정)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
 
-        return compressed_bytes
+        # 3) Hough Line Transform 기반 deskew
+        edges = cv2.Canny(enhanced, 50, 150, apertureSize=3)
+        lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=100,
+                                minLineLength=img.shape[1] // 4, maxLineGap=10)
+        if lines is not None and len(lines) > 5:
+            angles = []
+            for line in lines:
+                x1, y1, x2, y2 = line[0]
+                angle = np.degrees(np.arctan2(y2 - y1, x2 - x1))
+                if abs(angle) < 10:  # 거의 수평인 선만
+                    angles.append(angle)
+            if angles:
+                median_angle = np.median(angles)
+                if abs(median_angle) > 0.3 and abs(median_angle) < 5:
+                    (h, w) = enhanced.shape
+                    center = (w // 2, h // 2)
+                    M = cv2.getRotationMatrix2D(center, median_angle, 1.0)
+                    enhanced = cv2.warpAffine(
+                        enhanced, M, (w, h),
+                        flags=cv2.INTER_CUBIC,
+                        borderMode=cv2.BORDER_REPLICATE
+                    )
+
+        # 4) 약한 선명화 (과도한 sharpening 방지)
+        blurred = cv2.GaussianBlur(enhanced, (0, 0), 2)
+        sharpened = cv2.addWeighted(enhanced, 1.3, blurred, -0.3, 0)
+
+        # PNG 인코딩
+        _, encoded = cv2.imencode('.png', sharpened)
+        return encoded.tobytes(), 'png'
     except Exception:
-        # 압축 실패 시 원본 반환 (안전 장치)
-        return file_bytes
+        return file_bytes, 'png'
+
 
 # =====================================================================
-# �🖼️ 이미지 전처리 함수 (OpenCV)
+# 📝 Fuzzy Matching 오타 보정 (경매 용어 특화)
 # =====================================================================
-def preprocess_image(file_bytes):
-    """스마트폰으로 찍은 사진의 OCR 인식률을 향상시키기 위한 전처리 파이프라인.
-    등기부등본 등 법률 문서에 최적화: 이진화 대신 대조도(CLAHE) + 선명도(Sharpening)만 적용.
-    1) 그레이스케일 변환
-    2) CLAHE(대조도 향상)로 그림자/조명 편차 균일화
-    3) 언샤프 마스크(Sharpening)로 글자 선명도 향상
-    4) 기울기 보정(deskew)으로 수평 맞춤
-    5) PNG 바이트로 재인코딩
-    """
-    # 바이트 → numpy 배열 → OpenCV 이미지
-    nparr = np.frombuffer(file_bytes, np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    if img is None:
-        return file_bytes  # 디코딩 실패 시 원본 반환
+# 경매 핵심 용어 사전 (OCR 오타 → 정확한 용어)
+AUCTION_TERM_CORRECTIONS = {
+    '가입류': '가압류', '가압유': '가압류', '가앞류': '가압류', '가압르': '가압류',
+    '근저당관': '근저당권', '근저당귄': '근저당권', '근저당건': '근저당권',
+    '근저당궈설정': '근저당권설정', '근저당관설정': '근저당권설정',
+    '소유관이전': '소유권이전', '소유귄이전': '소유권이전', '소유건이전': '소유권이전',
+    '채권최교액': '채권최고액', '채권쵀고액': '채권최고액', '채권최고엑': '채권최고액',
+    '임의경매개시겸정': '임의경매개시결정', '임의경매겨시결정': '임의경매개시결정',
+    '강제경매개시겸정': '강제경매개시결정',
+    '전세관': '전세권', '전세귄': '전세권', '전세건': '전세권',
+    '지상관': '지상권', '지상귄': '지상권', '지상건': '지상권',
+    '유치관': '유치권', '유치귄': '유치권',
+    '저당관': '저당권', '저당귄': '저당권',
+    '담보가등거': '담보가등기', '담보가등끼': '담보가등기',
+    '소유관': '소유권', '소유귄': '소유권',
+    '말쇄': '말소', '말세': '말소',
+    '접수': '접수', '첩수': '접수',
+    '순위벤호': '순위번호', '순위번헌': '순위번호',
+    '등기뫽적': '등기목적', '등기목젹': '등기목적',
+    '배당요규': '배당요구',
+    '가처붐': '가처분', '가처뷴': '가처분',
+    '압류': '압류', '압유': '압류',
+    '경매개시겸정': '경매개시결정',
+}
 
-    # 1) 그레이스케일
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+def _levenshtein_distance(s1, s2):
+    """두 문자열 사이의 Levenshtein 편집 거리를 계산합니다."""
+    if len(s1) < len(s2):
+        return _levenshtein_distance(s2, s1)
+    if len(s2) == 0:
+        return len(s1)
+    prev_row = range(len(s2) + 1)
+    for i, c1 in enumerate(s1):
+        curr_row = [i + 1]
+        for j, c2 in enumerate(s2):
+            insertions = prev_row[j + 1] + 1
+            deletions = curr_row[j] + 1
+            substitutions = prev_row[j] + (c1 != c2)
+            curr_row.append(min(insertions, deletions, substitutions))
+        prev_row = curr_row
+    return prev_row[-1]
 
-    # 2) CLAHE (대조도 향상) — 이진화보다 부드럽게 그림자/조명 보정
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    enhanced = clahe.apply(gray)
+def fuzzy_clean_text(text):
+    """OCR 인식 결과에서 경매 용어 오타를 유사도 기반으로 자동 보정합니다."""
+    # 1단계: 정확한 매칭 (빠른 경로)
+    for wrong, correct in AUCTION_TERM_CORRECTIONS.items():
+        if wrong in text:
+            text = text.replace(wrong, correct)
 
-    # 3) 언샤프 마스크 (선명도 향상) — 글자 경계를 또렷하게
-    blurred = cv2.GaussianBlur(enhanced, (0, 0), 3)
-    sharpened = cv2.addWeighted(enhanced, 1.5, blurred, -0.5, 0)
+    # 2단계: Fuzzy 매칭 (편집거리 1~2 이내)
+    # 텍스트를 공백 기준으로 분리하여 각 토큰 검사
+    words = text.split()
+    corrected_words = []
+    # 정확한 용어 목록 (중복 제거)
+    correct_terms = list(set(AUCTION_TERM_CORRECTIONS.values()))
 
-    # 4) 기울기 보정 (deskew)
-    # 이진화는 기울기 감지용으로만 임시 사용 (최종 출력에는 미적용)
-    _, temp_thresh = cv2.threshold(sharpened, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    coords = np.column_stack(np.where(temp_thresh > 0))  # 글자 픽셀 좌표
-    if len(coords) > 100:  # 충분한 텍스트 픽셀이 있을 때만
-        angle = cv2.minAreaRect(coords)[-1]
-        # minAreaRect 각도 보정: -90~0 범위를 실제 기울기로 변환
-        if angle < -45:
-            angle = -(90 + angle)
+    for word in words:
+        if len(word) >= 2:  # 2글자 이상만 검사
+            best_match = None
+            best_dist = float('inf')
+            for term in correct_terms:
+                # 길이 차이가 2 이상이면 스킵 (효율성)
+                if abs(len(word) - len(term)) > 2:
+                    continue
+                dist = _levenshtein_distance(word, term)
+                if dist <= 2 and dist < best_dist and dist > 0:
+                    best_dist = dist
+                    best_match = term
+            if best_match:
+                corrected_words.append(best_match)
+            else:
+                corrected_words.append(word)
         else:
-            angle = -angle
-        # 5도 이내의 기울기만 보정 (과보정 방지)
-        if abs(angle) > 0.3 and abs(angle) < 5:
-            (h, w) = sharpened.shape
-            center = (w // 2, h // 2)
-            M = cv2.getRotationMatrix2D(center, angle, 1.0)
-            sharpened = cv2.warpAffine(
-                sharpened, M, (w, h),
-                flags=cv2.INTER_CUBIC,
-                borderMode=cv2.BORDER_REPLICATE
-            )
+            corrected_words.append(word)
 
-    # 5) PNG 바이트로 인코딩
-    _, encoded = cv2.imencode('.png', sharpened)
-    return encoded.tobytes()
+    return ' '.join(corrected_words)
 
 # =====================================================================
 # 🔑 2. API 키 자동 로드 (스트림릿 비밀 금고)
@@ -629,6 +677,79 @@ def ask_gemini_for_safety_report(df, base_date, model, spec_summary=None, parsed
         return "종합 안전도 리포트 생성 실패 (API 오류)"
 
 
+def ask_gemini_vision_review(images_bytes_list, ocr_text, parsed_summary, model):
+    """원본 이미지 + OCR 결과를 Gemini Vision에 보내 최종 검수합니다.
+    최대 15장까지 처리, 각 이미지 1024px 리사이즈 + 500KB~1MB 압축."""
+    try:
+        # 📷 Smart Resizing: 긴 축 1024px + JPEG Q65 (약 500KB~1MB)
+        image_parts = []
+        for i, img_bytes in enumerate(images_bytes_list[:15]):
+            try:
+                pil_img = Image.open(BytesIO(img_bytes))
+                # EXIF 회전 보정
+                try:
+                    from PIL import ImageOps
+                    pil_img = ImageOps.exif_transpose(pil_img)
+                except Exception:
+                    pass
+                # 긴 축 1024px 리사이즈 (Gemini 전송용 저용량 복사본)
+                max_dim = max(pil_img.width, pil_img.height)
+                if max_dim > 1024:
+                    ratio = 1024 / max_dim
+                    new_w = int(pil_img.width * ratio)
+                    new_h = int(pil_img.height * ratio)
+                    pil_img = pil_img.resize((new_w, new_h), Image.LANCZOS)
+                # RGB 변환 + JPEG 압축
+                if pil_img.mode != 'RGB':
+                    pil_img = pil_img.convert('RGB')
+                buf = BytesIO()
+                pil_img.save(buf, format='JPEG', quality=65, optimize=True)
+                buf.seek(0)
+                image_parts.append({
+                    'mime_type': 'image/jpeg',
+                    'data': buf.getvalue()
+                })
+            except Exception:
+                continue
+
+        if not image_parts:
+            return "Vision 검수 실패: 이미지 변환 오류"
+
+        num_pages = len(image_parts)
+        prompt = f"""
+        너는 대한민국 경매 등기부등본 판독 최고 전문가야.
+        지금 {num_pages}페이지에 달하는 등기부를 분석해야 해. 모든 페이지를 빠짐없이 꼼꼼히 확인해 줘.
+        아래는 OCR이 인식한 결과와 파싱된 요약이야. 원본 이미지와 대조하여 검수해 줘.
+
+        [OCR 인식 요약]
+        {ocr_text[:3000]}
+
+        [파싱 결과 요약]
+        {parsed_summary[:1500]}
+
+        [검수 지시사항]
+        1. 원본 이미지에서 **가로줄(취소선)이 그어진 등기**가 있는지 확인해. 가로줄이 있으면 "이미 말소됨"으로 판단해야 해.
+           → 특히 이전 페이지에서 시작된 가로줄이 다음 페이지까지 이어지는지 교차 확인해.
+        2. 각 페이지의 순위번호가 연속적으로 이어지는지 확인해. 순위번호가 누락된 것이 있으면 알려줘.
+        3. OCR이 놓친 순위번호나 등기목적이 있는지 확인해.
+        4. 금액(채권최고액 등)이 정확하게 인식되었는지 확인해.
+        5. 갑구/을구 구분이 정확한지 확인해.
+
+        [출력 형식]
+        - 문제가 없으면: "✅ Vision 검수 완료: {num_pages}페이지 전체 대조 결과, OCR 결과와 원본 이미지가 일치합니다."
+        - 문제가 있으면: 각 문제를 간결하게 나열:
+          "⚠️ [1] 순위번호 X번: 이미지에 가로줄(취소선) 확인됨 → '이미 말소됨'으로 변경 필요"
+          "⚠️ [2] OCR 누락: 순위번호 Y번 등기가 이미지에 있으나 OCR에서 누락됨"
+          "⚠️ [3] 페이지 Z-W 간 가로줄 연속: 순위번호 A번 등기가 두 페이지에 걸쳐 말소 표시됨"
+        """
+
+        # Gemini multimodal: 이미지 + 텍스트
+        content_parts = image_parts + [prompt]
+        response = model.generate_content(content_parts)
+        return response.text
+    except Exception as e:
+        return f"Vision 검수 실패: {e}"
+
 def merge_and_sort_pages(sorted_files, ocr_cache):
     """여러 장의 등기부등본 페이지를 갑구/을구 섹션 기반으로 자동 정렬합니다.
     페이지 순서가 섞여 있어도 표제부→갑구→을구 순서로 올바르게 재배열합니다."""
@@ -701,6 +822,10 @@ if 'base_date_info' not in st.session_state:
     st.session_state.base_date_info = None  # 📅 말소기준권리 상세 정보
 if 'safety_report' not in st.session_state:
     st.session_state.safety_report = None  # 🧾 종합 안전도 리포트
+if 'uploaded_images' not in st.session_state:
+    st.session_state.uploaded_images = []  # 📷 원본 이미지 (Gemini Vision용)
+if 'vision_review' not in st.session_state:
+    st.session_state.vision_review = None  # 🔬 Gemini Vision 검수 결과
 
 # =====================================================================
 # 📱 [1단계 화면] 메인 화면 및 사진 업로드
@@ -731,9 +856,11 @@ if st.session_state.step == 1:
                 total_files = len(uploaded_files)
                 sorted_files = sorted(uploaded_files, key=natural_sort_key)
                 progress_bar = st.progress(0, text='📸 분석 준비 중...')
+                uploaded_image_bytes = []  # 📷 원본 이미지 저장 (Gemini Vision용)
 
                 for file_idx, file in enumerate(sorted_files):
                     raw_bytes = file.getvalue()
+                    uploaded_image_bytes.append(raw_bytes)  # 📷 Vision용 원본 보존
 
                     # 💰 OCR 캐싱: 파일 해시로 중복 체크 (부분 재분석 지원)
                     file_hash = hashlib.sha256(raw_bytes).hexdigest()
@@ -745,11 +872,9 @@ if st.session_state.step == 1:
 
                     progress_bar.progress((file_idx) / total_files, text=f'📸 분석 중 ({file_idx + 1}/{total_files}): {file.name}')
 
-                    # � 원본 사진 그대로 네이버 OCR에 전송 (전처리 제거 — API가 원본 컬러 사진을 더 잘 인식)
-                    file_ext = file.name.rsplit('.', 1)[-1].lower() if '.' in file.name else 'jpg'
-                    mime_map = {'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'png': 'image/png'}
-                    file_mime = mime_map.get(file_ext, 'image/jpeg')
-                    file_format = 'png' if file_ext == 'png' else 'jpg'
+                    # 🖼️ 스마트 전처리: Grayscale + CLAHE + Deskew → PNG
+                    preprocessed_bytes, file_format = smart_preprocess(raw_bytes)
+                    file_mime = 'image/png'
 
                     request_json = {'images': [{'format': file_format, 'name': 'demo'}], 'requestId': str(uuid.uuid4()), 'version': 'V2', 'timestamp': int(round(time.time() * 1000))}
                     payload = {'message': json.dumps(request_json).encode('UTF-8')}
@@ -758,7 +883,7 @@ if st.session_state.step == 1:
                     # 🔄 네이버 OCR API 호출 (timeout 30초 + 재시도 2회)
                     response = None
                     for attempt in range(3):
-                        file_data = [('file', (file.name, raw_bytes, file_mime))]
+                        file_data = [('file', (file.name, preprocessed_bytes, file_mime))]
                         try:
                             response = requests.post(
                                 NAVER_API_URL, headers=headers, data=payload,
@@ -788,13 +913,22 @@ if st.session_state.step == 1:
                             continue
 
                         current_row, last_y, page_rows = [], -1, []
+                        low_conf_words = []  # 저신뢰도 단어 수집
                         sorted_fields = sorted(fields, key=lambda x: x['boundingPoly']['vertices'][0]['y'])
 
                         for field in sorted_fields:
                             text = field['inferText']
+                            confidence = field.get('inferConfidence', 1.0)
                             y_pos = field['boundingPoly']['vertices'][0]['y']
                             x_pos = field['boundingPoly']['vertices'][0]['x']
                             text = re.sub(r'(\d{6})\s*-\s*\d{7}', r'\1-*******', text)
+
+                            # 📝 저신뢰도 단어 → Fuzzy Matching 우선 보정
+                            if confidence < 0.5:
+                                original_text = text
+                                text = fuzzy_clean_text(text)
+                                if text != original_text:
+                                    low_conf_words.append(f"'{original_text}'→'{text}' (신뢰도:{confidence:.2f})")
 
                             if last_y == -1 or abs(y_pos - last_y) <= 20:
                                 current_row.append({'x': x_pos, 'text': text})
@@ -807,6 +941,12 @@ if st.session_state.step == 1:
                         if current_row:
                             current_row.sort(key=lambda x: x['x'])
                             page_rows.append(" ".join([item['text'] for item in current_row]))
+
+                        # 📝 전체 행에 Fuzzy 오타 보정 적용
+                        page_rows = [fuzzy_clean_text(row) for row in page_rows]
+
+                        if low_conf_words:
+                            st.toast(f"📝 {file.name}: {len(low_conf_words)}개 저신뢰도 단어 자동 보정")
 
                         st.session_state.ocr_cache[file_hash] = page_rows
                         all_clean_rows.extend(page_rows)
@@ -888,8 +1028,19 @@ if st.session_state.step == 1:
                     def parse_records_from_rows(rows):
                         """OCR 텍스트 행들에서 등기 레코드를 파싱합니다."""
                         _records, _current_record, _current_gu = [], {}, None
+                        # 순위번호: 기본 패턴 + 느슨한 fallback
                         _rank_pattern = re.compile(r'^([1-9]\d*[-]?\d*)(?:\s+|번|(?=[가-힣]))')
-                        _date_pattern = re.compile(r'(\d{4})년\s*(\d{1,2})월\s*(\d{1,2})일')
+                        # 날짜: 3단계 fallback
+                        _date_patterns = [
+                            re.compile(r'(\d{4})년\s*(\d{1,2})월\s*(\d{1,2})일'),  # 2024년 01월 31일
+                            re.compile(r'(\d{4})[.\-/](\d{1,2})[.\-/](\d{1,2})'),  # 2024.01.31 / 2024-01-31
+                            re.compile(r'(20\d{2})(\d{2})(\d{2})'),  # 20240131 (8자리 연속 숫자)
+                        ]
+                        # 접수번호: 2단계 fallback
+                        _receipt_patterns = [
+                            re.compile(r'제\s*(\d+)\s*호'),  # 제XXXXX호
+                            re.compile(r'(?<!번호)(?<!년)(?<!월)(?<!일)(\d{5,6})(?!년|월|일|호|번)'),  # 5~6자리 숫자 (날짜/번호 제외)
+                        ]
 
                         for row in rows:
                             clean_row = row.replace(" ", "")
@@ -930,14 +1081,29 @@ if st.session_state.step == 1:
                         _parsed = []
                         for rec in _records:
                             content = rec['전체내용'].replace(" ", "")
-                            date_match = _date_pattern.search(rec['전체내용'])
+                            # 날짜 추출: 3단계 fallback
+                            date_match = None
+                            for dp in _date_patterns:
+                                date_match = dp.search(rec['전체내용'])
+                                if date_match:
+                                    break
                             rec['접수일자_기준'] = None
 
                             if date_match:
                                 y, m, d = date_match.groups()
-                                rec['접수일자_기준'] = datetime.date(int(y), int(m), int(d))
-                                receipt_match = re.search(r'제\s*(\d+)\s*호', rec['전체내용'])
-                                rec['접수일자_표시'] = f"{y}년 {m}월 {d}일" + (f" 제{receipt_match.group(1)}호" if receipt_match else "")
+                                try:
+                                    rec['접수일자_기준'] = datetime.date(int(y), int(m), int(d))
+                                except ValueError:
+                                    pass
+
+                                # 접수번호 추출: 2단계 fallback
+                                receipt_num = None
+                                for rp in _receipt_patterns:
+                                    rm = rp.search(rec['전체내용'])
+                                    if rm:
+                                        receipt_num = rm.group(1)
+                                        break
+                                rec['접수일자_표시'] = f"{y}년 {m}월 {d}일" + (f" 제{receipt_num}호" if receipt_num else "")
 
                                 raw_target = rec['전체내용'][:date_match.start()].replace(rec['순위번호'], '', 1).strip()
                                 action_strip_pattern = r'^번\s*|(?:전부)?근저당권설정$|가압류$|임의경매개시결정$|강제경매개시결정$|압류$|경매개시결정$'
@@ -1075,6 +1241,21 @@ if st.session_state.step == 1:
                             df, base_date, model, spec_summary, parsed_records
                         )
                 st.session_state.safety_report = safety_report
+
+                # 🔬 Gemini Vision 최종 검수 (원본 이미지 대조)
+                vision_review = None
+                if uploaded_image_bytes:
+                    num_imgs = min(len(uploaded_image_bytes), 15)
+                    est_time = max(20, num_imgs * 3)  # 예상 소요 시간
+                    st.info(f'🔍 현재 {num_imgs}장의 등기부 사진을 AI가 정밀 대조 중입니다. 약 {est_time}~{est_time + 10}초가 소요될 수 있습니다...')
+                    with st.spinner(f'🔬 Gemini Vision이 {num_imgs}페이지 원본 이미지를 검수하고 있습니다...'):
+                        ocr_summary = '\n'.join(all_clean_rows[:80])  # OCR 요약 (상위 80행)
+                        parsed_summary = '\n'.join([f"{r.get('구분','')} #{r.get('순위번호','')} {r.get('등기목적','')} → {r.get('접수일자_표시','')}" for r in parsed_records[:30]])
+                        vision_review = ask_gemini_vision_review(
+                            uploaded_image_bytes, ocr_summary, parsed_summary, model
+                        )
+                st.session_state.vision_review = vision_review
+                st.session_state.uploaded_images = uploaded_image_bytes
 
                 st.session_state.step = 2
                 st.rerun()
@@ -1352,10 +1533,23 @@ elif st.session_state.step == 2:
 
     st.markdown("<br>", unsafe_allow_html=True)
 
+    # 🔬 Gemini Vision 검수 결과
+    if st.session_state.vision_review:
+        with st.expander("🔬 Gemini Vision 최종 검수 결과", expanded=True):
+            review = st.session_state.vision_review
+            if '✅' in review:
+                st.success(review)
+            elif '⚠️' in review:
+                st.warning(review)
+            else:
+                st.info(review)
+        st.markdown("<br>", unsafe_allow_html=True)
+
     if st.button("🔄 처음으로 돌아가기", use_container_width=True):
         # 🔄 전체 세션 상태 초기화 (이전 결과 혼합 방지)
         for key in ['final_df', 'malso_df', 'spec_summary', 'danger_warnings',
-                     'malso_omission_report', 'base_date_info', 'safety_report']:
+                     'malso_omission_report', 'base_date_info', 'safety_report',
+                     'uploaded_images', 'vision_review']:
             if key in st.session_state:
                 del st.session_state[key]
         st.session_state.step = 1
