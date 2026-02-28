@@ -588,6 +588,416 @@ def ask_gemini_for_rights_batch(ai_rows_data, base_date, model, spec_summary=Non
             fallback[item['index']] = {'결과': '추가확인', '이유': f'⚠️ 판단 지연(수동 확인) — AI 응답 파싱 실패: {str(e)[:50]}'}
         return fallback
 
+# =====================================================================
+# 🔬 고급 교차 검증 로직 (등기부 전체 + 매각물건명세서 교차 분석)
+# =====================================================================
+
+def detect_daewi_risk(df, parsed_records):
+    """대위변제 위험 감지: 1순위 근저당 금액이 소액이고
+    후순위에 임차인 보증금이 클 때 경고를 생성합니다.
+    대위변제 = 후순위 임차인이 선순위 근저당 채무를 대신 갚고
+    근저당을 이전받아 경매를 취소시킬 수 있는 위험.
+    """
+    warnings = []
+    try:
+        all_text = ' '.join([str(r.get('전체내용', '')) for r in parsed_records])
+
+        # 1순위 근저당(말소기준권리) 채권최고액 추출
+        mortgage_amounts = []
+        for _, row in df.iterrows():
+            content = str(row.get('전체내용', ''))
+            purpose = str(row.get('등기목적', ''))
+            if row.get('말소후보', False) and ('근저당' in purpose or '근저당' in content):
+                amt_match = re.search(r'(?:채권최고액|금)\s*([\d,]+)\s*원', content.replace(' ', ''))
+                if amt_match:
+                    try:
+                        mortgage_amounts.append(int(amt_match.group(1).replace(',', '')))
+                    except ValueError:
+                        pass
+
+        # 임차인/전세권 보증금 추출
+        tenant_amounts = []
+        for _, row in df.iterrows():
+            content = str(row.get('전체내용', ''))
+            purpose = str(row.get('등기목적', ''))
+            if '임차' in purpose or '전세' in purpose or '임차' in content or '전세' in content:
+                amt_match = re.search(r'(?:보증금|전세금|금)\s*([\d,]+)\s*원', content.replace(' ', ''))
+                if amt_match:
+                    try:
+                        tenant_amounts.append(int(amt_match.group(1).replace(',', '')))
+                    except ValueError:
+                        pass
+
+        if mortgage_amounts and tenant_amounts:
+            min_mortgage = min(mortgage_amounts)
+            max_tenant = max(tenant_amounts)
+            # 1순위 근저당이 임차인 보증금의 30% 미만이면 대위변제 위험
+            if min_mortgage > 0 and max_tenant > min_mortgage * 3:
+                warnings.append(
+                    f"⚠️ [대위변제 위험] 1순위 근저당 채권최고액({min_mortgage:,}원)이 "
+                    f"후순위 임차인 보증금({max_tenant:,}원)보다 현저히 작습니다. "
+                    f"임차인이 근저당 채무를 대위변제하여 경매를 취소시킬 수 있는 위험이 있습니다."
+                )
+    except Exception:
+        pass
+    return warnings
+
+def detect_tax_seizure_conflict(df, parsed_records):
+    """조세채권(당해세) 충돌 감지: '압류' 중 체납처분(세금) 압류가 있으면
+    당해세가 임차인보다 우선 배당되어 임차인 미배당 잔액(인수액)이 증가할 위험을 경고.
+    """
+    warnings = []
+    try:
+        has_tax_seizure = False
+        has_senior_tenant = False
+
+        for _, row in df.iterrows():
+            content = str(row.get('전체내용', ''))
+            purpose = str(row.get('등기목적', ''))
+            result = str(row.get('결과', ''))
+
+            # 체납처분 압류 (세금 관련) 감지
+            if ('압류' in purpose or '압류' in content) and any(k in content for k in [
+                '체납처분', '국세', '지방세', '세무서', '시청', '구청', '세금', '당해세',
+                '재산세', '종합부동산세', '취득세', '양도소득세'
+            ]):
+                has_tax_seizure = True
+
+            # 선순위 임차인 (인수 판정된) 감지
+            if ('임차' in content or '전세' in content) and '인수' in result:
+                has_senior_tenant = True
+
+        if has_tax_seizure and has_senior_tenant:
+            warnings.append(
+                "⚠️ [당해세 충돌 경고] 체납처분 압류(세금)가 발견되었습니다. "
+                "당해세(재산세·종부세 등)는 법정기일에 관계없이 근저당권보다 우선 배당되므로, "
+                "선순위 임차인에게 돌아갈 배당금이 줄어들어 매수인의 인수액이 증가할 수 있습니다."
+            )
+        elif has_tax_seizure:
+            warnings.append(
+                "⚠️ [조세채권 경고] 체납처분 압류(세금)가 발견되었습니다. "
+                "당해세는 우선 배당 대상이므로 배당 순위에 영향을 줄 수 있습니다."
+            )
+    except Exception:
+        pass
+    return warnings
+
+def apply_spec_overrides(df, spec_summary):
+    """매각물건명세서 Override: 비고란 핵심 키워드가 발견되면
+    기존 determine_status 판단을 덮어씁니다.
+    """
+    warnings = []
+    if not spec_summary:
+        return warnings
+
+    spec_text = str(spec_summary)
+
+    try:
+        # 1. 대항력 포기 / HUG 확약서 → 선순위 임차권/전세권 Override: 인수 → 말소
+        if any(k in spec_text for k in ['대항력 포기', '대항력포기', '확약서', '무상거주확인서', '인수조건변경']):
+            for idx, row in df.iterrows():
+                content = str(row.get('전체내용', ''))
+                result = str(row.get('결과', ''))
+                if ('임차' in content or '전세' in content) and '인수' in result:
+                    df.at[idx, '결과'] = "❌ 말소 (Override)"
+                    df.at[idx, 'AI_상세이유'] = "매각물건명세서에 대항력 포기/확약서 기재 → 인수 → 말소로 변경"
+            warnings.append("💡 [Override] 대항력 포기/확약서 확인됨 — 선순위 임차권도 소멸 처리")
+
+        # 2. 토지별도등기 인수 → 후순위라도 강제 인수
+        if any(k in spec_text for k in ['토지별도등기', '토지 별도등기', '별도등기 있음']):
+            warnings.append(
+                "⚠️ [토지별도등기 경고] 대지에 별도의 근저당 등이 설정되어 있어 "
+                "건물 외에 토지 부분의 채무를 추가 인수할 위험이 있습니다."
+            )
+
+        # 3. 대지권 미등기
+        if any(k in spec_text for k in ['대지권 미등기', '대지권미등기', '대지사용권 없음']):
+            warnings.append(
+                "⚠️ [대지권 미등기 경고] 집합건물의 대지권이 미등기 상태입니다. "
+                "추가 분양대금 납부 또는 대지권 취득을 위한 추가 비용이 발생할 수 있습니다."
+            )
+
+        # 4. 특별매각조건 인수 → 말소 대상도 강제 인수 Override
+        if any(k in spec_text for k in ['특별매각조건', '매수인이 인수', '인수하는 조건', '가압류등기의 부담을 매수인이 인수']):
+            for idx, row in df.iterrows():
+                content = str(row.get('전체내용', ''))
+                result = str(row.get('결과', ''))
+                if '말소' in result and any(k in content for k in ['가압류', '근저당', '압류']):
+                    # 특별매각조건에 명시적으로 인수 대상으로 지정된 경우
+                    if any(k in spec_text for k in [row.get('순위번호', '___NOMATCH___')]):
+                        df.at[idx, '결과'] = "🚨 절대 인수 (Override)"
+                        df.at[idx, 'AI_상세이유'] = "특별매각조건에 따라 말소 → 인수로 변경"
+            warnings.append("⚠️ [Override] 특별매각조건이 발견되었습니다 — 일부 말소 대상이 인수로 변경될 수 있습니다.")
+
+        # 5. 유치권 신고
+        if any(k in spec_text for k in ['유치권 신고', '유치권 행사', '유치권 성립여부']):
+            warnings.append(
+                "🚨 [유치권 경고] 매각물건명세서에 유치권 신고가 기재되어 있습니다. "
+                "낙찰대금 외에 공사대금 등을 전액 떠안을 수 있으며 건물 인도가 불가할 수 있습니다."
+            )
+
+        # 6. 농지취득자격증명
+        if any(k in spec_text for k in ['농지취득자격증명', '농취증']):
+            warnings.append(
+                "❗ [보증금 몰수 경고] 농지취득자격증명 제출이 필요합니다. "
+                "매각결정기일까지 미제출 시 입찰 보증금이 전액 몰수됩니다."
+            )
+
+        # 7. 법정지상권 성립 여지
+        if any(k in spec_text for k in ['법정지상권 성립', '법정지상권이 성립할 여지']):
+            warnings.append(
+                "🚨 [법정지상권 경고] 매각물건명세서에 법정지상권 성립 여지가 기재되어 있습니다. "
+                "토지 사용에 제한을 받을 수 있습니다."
+            )
+
+        # 8. 위반건축물 / 원상회복
+        if any(k in spec_text for k in ['위반건축물', '원상회복', '불법형질변경']):
+            warnings.append(
+                "⚠️ [원상회복 경고] 위반건축물 또는 불법 형질변경이 확인되었습니다. "
+                "이행강제금 부과 및 원상복구 비용을 매수인이 부담해야 합니다."
+            )
+
+        # 9. 건물만 매각 / 제시외 건물
+        if any(k in spec_text for k in ['건물만 매각', '제시외 건물', '제시외건물']):
+            warnings.append(
+                "⚠️ [제시외 건물/건물만 매각] 대지 소유권이 없는 건물이거나 "
+                "매각 대상에 포함되지 않는 제시외 건물이 있어 분쟁 위험이 있습니다."
+            )
+
+    except Exception:
+        pass
+    return warnings
+
+def detect_share_auction_and_trust(df, parsed_records, all_clean_rows=None):
+    """지분경매 및 신탁등기 감지:
+    - 공유지분 경매 시 '공유자 우선매수청구권' 경고
+    - 신탁등기 발견 시 '신탁원부 확인' 경고
+    """
+    warnings = []
+    try:
+        all_text = ' '.join([str(r.get('전체내용', '')) for r in parsed_records])
+        # OCR 원본도 함께 검토
+        if all_clean_rows:
+            all_text += ' ' + ' '.join(all_clean_rows[:200])
+
+        # 지분경매 감지
+        share_keywords = ['지분', '공유', '분의', '2분의1', '3분의1', '4분의1',
+                          '1/2', '1/3', '1/4', '공유자', '지분이전', '지분매각']
+        if any(k in all_text for k in share_keywords):
+            warnings.append(
+                "⚠️ [지분경매 경고] 공유지분 관련 등기가 발견되었습니다. "
+                "다른 공유자에게 '우선매수청구권'이 있어, 낙찰을 받아도 공유자가 같은 가격에 "
+                "가져갈 수 있습니다. 또한 공유물분할청구 소송 위험도 있으니 신중하게 입찰하세요."
+            )
+
+        # 신탁등기 감지
+        trust_keywords = ['신탁', '신탁원부', '신탁등기', '수탁자', '위탁자',
+                          '자산관리공사', '우선수익자', '신탁계약']
+        if any(k in all_text for k in trust_keywords):
+            warnings.append(
+                "⚠️ [신탁등기 경고] 신탁 관련 등기가 발견되었습니다. "
+                "반드시 '신탁원부'를 열람하여 우선수익자, 신탁 조건, 처분 제한 여부를 확인하세요. "
+                "신탁원부에 따라 매수인의 소유권 행사가 제한될 수 있습니다."
+            )
+
+    except Exception:
+        pass
+    return warnings
+
+def detect_prev_owner_claims(df, parsed_records, spec_summary=None):
+    """전 소유자 가압류/가처분 감지:
+    채무자가 현재 소유자와 다른 가압류/가처분이 있으면
+    매각물건명세서의 인수 조건을 교차 검증합니다.
+    """
+    warnings = []
+    try:
+        # 현재 소유자 이름 추출 (마지막 소유권이전 기록)
+        current_owner = None
+        for _, row in df.iterrows():
+            purpose = str(row.get('등기목적', ''))
+            if '소유권이전' in purpose or '소유권' in purpose:
+                content = str(row.get('전체내용', ''))
+                # 이름 추출 시도 (한글 2~4글자 이름 패턴)
+                name_match = re.search(r'[가-힣]{2,4}(?:\s|$)', content)
+                if name_match:
+                    current_owner = name_match.group(0).strip()
+
+        if current_owner:
+            for idx, row in df.iterrows():
+                purpose = str(row.get('등기목적', ''))
+                content = str(row.get('전체내용', ''))
+                result = str(row.get('결과', ''))
+
+                if ('가압류' in purpose or '가처분' in purpose or
+                    '가압류' in content or '가처분' in content):
+                    # 채무자 이름 추출
+                    debtor_match = re.search(r'채무자[:\s]*([\uac00-\ud7a3]{2,4})', content)
+                    if debtor_match:
+                        debtor_name = debtor_match.group(1).strip()
+                        if debtor_name != current_owner:
+                            # 전 소유자의 채무로 인한 가압류/가처분
+                            spec_note = ""
+                            if spec_summary and ('특별매각조건' in str(spec_summary) or '인수' in str(spec_summary)):
+                                spec_note = " → 매각물건명세서에 특별매각조건/인수조건이 있어 인수될 수 있음"
+                            warnings.append(
+                                f"⚠️ [전 소유자 가압류/가처분] 현재 소유자({current_owner})와 "
+                                f"채무자({debtor_name})가 다른 가압류/가처분이 발견되었습니다. "
+                                f"전 소유자의 채무로 인한 권리로, 일반적으로는 말소되지만 "
+                                f"특별매각조건에 따라 인수될 수 있으니 명세서를 확인하세요.{spec_note}"
+                            )
+                            break  # 첨 번째만 보고
+    except Exception:
+        pass
+    return warnings
+
+def detect_wage_claim_risk(df, parsed_records):
+    """최우선 임금채권 경고: '임금', '근로복지공단' 등이 있으면서
+    대항력 있는 임차인이 있을 때 인수액 폭탄 위험을 경고합니다.
+    임금채권은 저당권보다 우선하여 임차인 배당금을 감소시탙니다.
+    """
+    warnings = []
+    try:
+        has_wage_claim = False
+        has_senior_tenant = False
+        wage_info = ""
+
+        for _, row in df.iterrows():
+            content = str(row.get('전체내용', ''))
+            purpose = str(row.get('등기목적', ''))
+            result = str(row.get('결과', ''))
+
+            # 임금채권 / 근로복지공단 감지
+            if any(k in content for k in ['임금', '근로복지공단', '퇴직금', '임금채권',
+                                          '임금등 체불금', '임금압류']):
+                has_wage_claim = True
+                wage_info = purpose
+
+            # 대항력 있는 임차인 (인수 판정된) 감지
+            if ('임차' in content or '전세' in content) and '인수' in result:
+                has_senior_tenant = True
+
+        if has_wage_claim and has_senior_tenant:
+            warnings.append(
+                f"🚨 [최우선 임금채권 경고] 임금/퇴직금 관련 채권({wage_info})이 발견되었습니다. "
+                f"임금채권은 저당권보다 최우선 배당되므로, 선순위 임차인에게 돌아갈 배당금이 "
+                f"대폭 감소하여 매수인의 인수액이 급격히 증가할 수 있습니다(인수액 폭탄 위험)."
+            )
+        elif has_wage_claim:
+            warnings.append(
+                f"⚠️ [임금채권 발견] 임금/퇴직금 관련 채권({wage_info})이 있습니다. "
+                f"최우선 변제권으로 배당 순위에 영향을 줄 수 있습니다."
+            )
+    except Exception:
+        pass
+    return warnings
+
+def detect_share_mortgage_scope(df, parsed_records, all_clean_rows=None):
+    """지분경매 근저당 범위 판별:
+    지분경매일 때 근저당권이 '부동산 전체'에 설정된 것인지
+    '해당 지분'에만 설정된 것인지 구분하여 무잉여 취소나 인수 위험을 경고.
+    """
+    warnings = []
+    try:
+        all_text = ' '.join([str(r.get('전체내용', '')) for r in parsed_records])
+        if all_clean_rows:
+            all_text += ' ' + ' '.join(all_clean_rows[:200])
+
+        # 지분경매 여부 확인
+        is_share_auction = any(k in all_text for k in [
+            '지분', '공유', '1/2', '1/3', '1/4', '2분의1', '3분의1',
+            '지분매각', '지분경매', '공유자'
+        ])
+
+        if not is_share_auction:
+            return warnings
+
+        # 근저당이 전체 부동산에 설정되었는지 확인
+        has_whole_property_mortgage = False
+        has_share_mortgage = False
+
+        for _, row in df.iterrows():
+            content = str(row.get('전체내용', ''))
+            purpose = str(row.get('등기목적', ''))
+
+            if '근저당' in purpose or '근저당' in content:
+                # 전체 부동산 설정 키워드
+                if any(k in content for k in ['부동산 전체', '전체부동산', '공동담보', '공동근저당']):
+                    has_whole_property_mortgage = True
+                # 지분만 설정 키워드
+                if any(k in content for k in ['지분에 대하여', '지분에 관하여', '해당 지분',
+                                              '지분근저당', '지분 근저당']):
+                    has_share_mortgage = True
+
+        if has_whole_property_mortgage:
+            warnings.append(
+                "🚨 [지분경매 근저당 전체설정] 근저당이 부동산 전체에 설정된 상태에서 "
+                "지분만 경매됩니다. 매각대금이 근저당아액의 지분 분배액에 미치지 못하면 "
+                "무잉여로 경매가 취소될 수 있으며, 근저당의 나머지 채무가 남을 수 있습니다."
+            )
+        elif has_share_mortgage:
+            warnings.append(
+                "⚠️ [지분경매 근저당 지분설정] 근저당이 해당 지분에만 설정되어 있습니다. "
+                "전체 부동산 근저당보다 위험은 낮지만, 다른 공유자 지분에 별도 담보가 "
+                "있는지 확인이 필요합니다."
+            )
+        elif is_share_auction:
+            # 명시적 키워드가 없지만 지분경매임을 감지
+            for _, row in df.iterrows():
+                content = str(row.get('전체내용', ''))
+                if '근저당' in content:
+                    warnings.append(
+                        "⚠️ [지분경매 근저당 범위 미상] 지분경매에서 근저당이 발견되었으나, "
+                        "전체 부동산 설정인지 지분 설정인지 명확하지 않습니다. "
+                        "등기부등본을 직접 확인하여 근저당 설정 범위를 파악하세요."
+                    )
+                    break
+
+    except Exception:
+        pass
+    return warnings
+
+def evaluate_eviction_difficulty(df, base_date, parsed_records):
+    """명도 난이도 평가:
+    대항력 없는 후순위 임차인이 '소액임차인 최우선변제' 대상이면
+    명도가 수월하다는 코멘트를 추가합니다.
+    """
+    warnings = []
+    try:
+        for idx, row in df.iterrows():
+            content = str(row.get('전체내용', ''))
+            result = str(row.get('결과', ''))
+            purpose = str(row.get('등기목적', ''))
+
+            # 후순위 임차인 (말소 판정된 임차권)
+            if ('임차' in content or '전세' in content) and '말소' in result:
+                # 보증금액 추출
+                amt_match = re.search(r'(?:보증금|전세금|금)\s*([\d,]+)\s*원', content.replace(' ', ''))
+                if amt_match:
+                    try:
+                        deposit = int(amt_match.group(1).replace(',', ''))
+                        # 소액임차인 최우선변제 기준 (2024년 기준 약 5,500만원 이하 — 지역별 다름)
+                        # 대략적인 기준으로 1억 이하를 소액으로 간주
+                        if deposit <= 100_000_000:
+                            existing_reason = str(df.at[idx, 'AI_상세이유'])
+                            eviction_note = (
+                                f" 🟢 [명도 수월] 보증금 {deposit:,}원은 소액임차인 "
+                                f"최우선변제 대상일 가능성이 높습니다. "
+                                f"배당으로 보증금을 회수할 수 있어 자발적 퇴거 가능성이 높고 명도가 수월합니다."
+                            )
+                            df.at[idx, 'AI_상세이유'] = existing_reason + eviction_note
+                        elif deposit > 100_000_000:
+                            existing_reason = str(df.at[idx, 'AI_상세이유'])
+                            eviction_note = (
+                                f" 🟡 [명도 주의] 보증금 {deposit:,}원은 소액임차인 "
+                                f"최우선변제 대상이 아닐 수 있어 명도소송이 필요할 수 있습니다."
+                            )
+                            df.at[idx, 'AI_상세이유'] = existing_reason + eviction_note
+                    except ValueError:
+                        pass
+    except Exception:
+        pass
+    return warnings
+
 def ask_gemini_for_malso_omission(all_records_text, base_date, model, spec_summary=None):
     """Gemini에게 '매각 후 소멸(말소) 대상 권리 분석' 미션을 부여하여,
     매각 시 소멸되어야 할 권리와 인수 주의 권리를 분류합니다."""
@@ -891,6 +1301,8 @@ if 'malso_omission_report' not in st.session_state:
     st.session_state.malso_omission_report = None  # 🔍 말소 누락 탐지 보고서
 if 'danger_warnings' not in st.session_state:
     st.session_state.danger_warnings = []  # 🚨 위험 경고 목록
+if 'cross_warnings' not in st.session_state:
+    st.session_state.cross_warnings = []  # 🔬 고급 교차 검증 경고 목록
 if 'base_date_info' not in st.session_state:
     st.session_state.base_date_info = None  # 📅 말소기준권리 상세 정보
 if 'safety_report' not in st.session_state:
@@ -1354,6 +1766,19 @@ if st.session_state.step == 1:
                         if '임차권' in purpose or '임차권' in content or '임차인' in content:
                             return "🤖 AI 정밀해석", ""
 
+                        # === 4-7: 동일 날짜 배틀 ===
+                        # 전입신고일과 근저당 설정일이 동일하면
+                        # 근저당이 우선 (등기는 당일 효력, 전입신고는 다음날 0시 효력)
+                        if has_date and row['접수일자_기준'] == base_date:
+                            # 임차 관련 권리는 동일일이면 근저당이 우선 (말소)
+                            if '임차' in content or '전세' in content or '전입' in content:
+                                return "❌ 말소", (
+                                    "전입신고일과 말소기준권리 설정일이 동일합니다. "
+                                    "전입신고는 다음날 0시에 효력이 발생하나 "
+                                    "근저당 등기는 당일 접수 시 즉시 효력이 발생하므로 "
+                                    "근저당이 우선하여 임차인은 대항력이 없습니다(말소)."
+                                )
+
                         # === 5순위: 일반 날짜 비교 ===
                         if is_junior:
                             return "❌ 말소", ""
@@ -1405,6 +1830,37 @@ if st.session_state.step == 1:
                             for index in ai_targets:
                                 df.at[index, '결과'] = "⚠️ 판단 지연(수동 확인)"
                                 df.at[index, 'AI_상세이유'] = f"AI 일괄 처리 실패: {str(e)[:80]}"
+
+                # =====================================================
+                # 🔬 고급 교차 검증 (등기부 전체 + 명세서 교차 분석)
+                # =====================================================
+                cross_warnings = []
+
+                # 1. 대위변제 위험 감지
+                cross_warnings.extend(detect_daewi_risk(df, parsed_records))
+
+                # 2. 조세채권(당해세) 충돌 감지
+                cross_warnings.extend(detect_tax_seizure_conflict(df, parsed_records))
+
+                # 3. 매각물건명세서 Override (비고란 키워드로 기존 판단 덮어쓰기)
+                cross_warnings.extend(apply_spec_overrides(df, spec_summary))
+
+                # 4. 지분경매 및 신탁등기 감지
+                cross_warnings.extend(detect_share_auction_and_trust(df, parsed_records, all_clean_rows))
+
+                # 5. 전 소유자 가압류/가처분 교차 검증
+                cross_warnings.extend(detect_prev_owner_claims(df, parsed_records, spec_summary))
+
+                # 6. 최우선 임금채권 경고
+                cross_warnings.extend(detect_wage_claim_risk(df, parsed_records))
+
+                # 7. 지분경매 근저당 범위 판별
+                cross_warnings.extend(detect_share_mortgage_scope(df, parsed_records, all_clean_rows))
+
+                # 8. 명도 난이도 평가
+                cross_warnings.extend(evaluate_eviction_difficulty(df, base_date, parsed_records))
+
+                st.session_state.cross_warnings = cross_warnings
 
                 # 🔍 매각 후 소멸(말소) 대상 권리 분석 수행
                 malso_omission_report = None
@@ -1756,6 +2212,20 @@ elif st.session_state.step == 2:
 
     st.markdown("<br><hr><br>", unsafe_allow_html=True)
 
+    # 🔬 고급 교차 검증 경고 표시
+    cross_warnings = st.session_state.get('cross_warnings', [])
+    if cross_warnings:
+        with st.expander(f"🔬 고급 교차 검증 경고 ({len(cross_warnings)}건)", expanded=True):
+            for w in cross_warnings:
+                if '🚨' in w or '⛔' in w:
+                    st.error(w)
+                elif '❗' in w:
+                    st.error(w)
+                elif '💡' in w:
+                    st.info(w)
+                else:
+                    st.warning(w)
+
     # 🔍 매각 후 소멸(말소) 대상 권리 분석 보고서
     if st.session_state.malso_omission_report:
         with st.expander("🔍 매각 후 소멸(말소) 대상 권리 분석 결과", expanded=True):
@@ -1801,6 +2271,7 @@ elif st.session_state.step == 2:
         # 🔄 전체 세션 상태 초기화 (이전 결과 혼합 방지)
         for key in ['final_df', 'malso_df', 'spec_summary', 'danger_warnings',
                      'malso_omission_report', 'base_date_info', 'safety_report',
+                     'cross_warnings',
                      'uploaded_images', 'vision_review']:
             if key in st.session_state:
                 del st.session_state[key]
