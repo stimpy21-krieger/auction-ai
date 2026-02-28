@@ -736,15 +736,17 @@ if st.session_state.step == 1:
                 progress_bar = st.progress(0, text='📸 문서 스캔 준비 중...')
 
                 for file_idx, file in enumerate(sorted_files):
-                    progress_bar.progress((file_idx) / total_files, text=f'📸 스캔 중 ({file_idx + 1}/{total_files}): {file.name}')
                     raw_bytes = file.getvalue()
 
                     # 💰 OCR 캐싱: 파일 해시로 중복 체크 (부분 재분석 지원)
                     file_hash = hashlib.sha256(raw_bytes).hexdigest()
                     if file_hash in st.session_state.ocr_cache:
+                        progress_bar.progress((file_idx + 1) / total_files, text=f'💰 캐시 사용 ({file_idx + 1}/{total_files}): {file.name}')
                         all_clean_rows.extend(st.session_state.ocr_cache[file_hash])
                         cache_hit_count += 1
                         continue
+
+                    progress_bar.progress((file_idx) / total_files, text=f'📸 스캔 중 ({file_idx + 1}/{total_files}): {file.name}')
 
                     # 📦 Step 1: Pillow로 이미지 압축 (1500px, JPEG Q80)
                     compressed_bytes = compress_and_preprocess(raw_bytes)
@@ -832,9 +834,10 @@ if st.session_state.step == 1:
 
 
                 # 📷 Feature C: 여러 장 등기부 페이지 연결 — 갑구/을구 자동 정렬
+                original_clean_rows = list(all_clean_rows)  # 원본 보존 (fallback용)
                 if total_files > 1:
                     merged_rows = merge_and_sort_pages(sorted_files, st.session_state.ocr_cache)
-                    if merged_rows:
+                    if merged_rows and len(merged_rows) == len(all_clean_rows):
                         all_clean_rows = merged_rows
                         st.toast('📷 여러 페이지가 갑구/을구 순서로 자동 정렬되었습니다!')
 
@@ -894,108 +897,109 @@ if st.session_state.step == 1:
                 analysis_rows = registry_rows if registry_rows else all_clean_rows
 
                 with st.spinner('파이썬 엔진이 권리를 분류하고 있습니다...'):
-                    records, current_record, current_gu = [], {}, None
-                    rank_pattern = re.compile(r'^([1-9]\d*[-]?\d*)(?:\s+|번|(?=[가-힣]))') 
-                    date_pattern = re.compile(r'(\d{4})년\s*(\d{1,2})월\s*(\d{1,2})일')
+                    def parse_records_from_rows(rows):
+                        """OCR 텍스트 행들에서 등기 레코드를 파싱합니다."""
+                        _records, _current_record, _current_gu = [], {}, None
+                        _rank_pattern = re.compile(r'^([1-9]\d*[-]?\d*)(?:\s+|번|(?=[가-힣]))')
+                        _date_pattern = re.compile(r'(\d{4})년\s*(\d{1,2})월\s*(\d{1,2})일')
 
-                    for row in analysis_rows:
-                        clean_row = row.replace(" ", "")
-                        
-                        if any(kw in clean_row for kw in ignore_keywords):
-                            continue
-                            
-                        if "갑구" in clean_row and ("소유권" in clean_row or "관한사항" in clean_row): current_gu = "갑구"; continue
-                        if "을구" in clean_row and ("소유권" in clean_row or "관한사항" in clean_row or "이외의권리" in clean_row): current_gu = "을구"; continue
-                        if current_gu is None or "순위번호" in row or "등기목적" in row or "접수" in row: continue
+                        for row in rows:
+                            clean_row = row.replace(" ", "")
+                            if any(kw in clean_row for kw in ignore_keywords):
+                                continue
+                            if "갑구" in clean_row and ("소유권" in clean_row or "관한사항" in clean_row): _current_gu = "갑구"; continue
+                            if "을구" in clean_row and ("소유권" in clean_row or "관한사항" in clean_row or "이외의권리" in clean_row): _current_gu = "을구"; continue
+                            if _current_gu is None or "순위번호" in row or "등기목적" in row or "접수" in row: continue
 
-                        match = rank_pattern.match(row)
-                        is_new_record = False
-                        
-                        if match:
-                            rank_str = match.group(1)
-                            rest_of_line = row[match.end():].strip()
-                            
-                            if "-" in rank_str:
-                                # ⚠️ 부등기 인식: "2-1" → 순위번호 2번의 부등기
-                                parts = rank_str.split('-')
-                                if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
-                                    parent_rank = int(parts[0])
-                                    if parent_rank <= 200:
-                                        is_new_record = True  # 부등기도 독립 레코드로 처리
-                            elif len(rank_str) >= 4 or int(rank_str) > 200: 
-                                pass 
-                            elif rest_of_line.startswith(('호', '동', '층', '길', '번지', 'm', '㎡', '전', '년', '월', '일')):
-                                pass 
+                            match = _rank_pattern.match(row)
+                            is_new_record = False
+
+                            if match:
+                                rank_str = match.group(1)
+                                rest_of_line = row[match.end():].strip()
+
+                                if "-" in rank_str:
+                                    parts = rank_str.split('-')
+                                    if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                                        parent_rank = int(parts[0])
+                                        if parent_rank <= 200:
+                                            is_new_record = True
+                                elif len(rank_str) >= 4 or int(rank_str) > 200:
+                                    pass
+                                elif rest_of_line.startswith(('호', '동', '층', '길', '번지', 'm', '㎡', '전', '년', '월', '일')):
+                                    pass
+                                else:
+                                    is_new_record = True
+
+                            if is_new_record:
+                                if _current_record: _records.append(_current_record)
+                                _current_record = {'구분': _current_gu, '순위번호': rank_str, '전체내용': row}
                             else:
-                                is_new_record = True 
+                                if _current_record: _current_record['전체내용'] += " " + row
 
-                        if is_new_record: 
-                            if current_record: records.append(current_record)
-                            current_record = {'구분': current_gu, '순위번호': rank_str, '전체내용': row}
-                        else: 
-                            if current_record: current_record['전체내용'] += " " + row
-                    
-                    if current_record: records.append(current_record)
+                        if _current_record: _records.append(_current_record)
 
-                    parsed_records = []
-                    for rec in records:
-                        content = rec['전체내용'].replace(" ", "")
-                        date_match = date_pattern.search(rec['전체내용'])
-                        rec['접수일자_기준'] = None
-                        
-                        if date_match:
-                            y, m, d = date_match.groups()
-                            rec['접수일자_기준'] = datetime.date(int(y), int(m), int(d))
+                        _parsed = []
+                        for rec in _records:
+                            content = rec['전체내용'].replace(" ", "")
+                            date_match = _date_pattern.search(rec['전체내용'])
+                            rec['접수일자_기준'] = None
+
+                            if date_match:
+                                y, m, d = date_match.groups()
+                                rec['접수일자_기준'] = datetime.date(int(y), int(m), int(d))
+                                receipt_match = re.search(r'제\s*(\d+)\s*호', rec['전체내용'])
+                                rec['접수일자_표시'] = f"{y}년 {m}월 {d}일" + (f" 제{receipt_match.group(1)}호" if receipt_match else "")
+
+                                raw_target = rec['전체내용'][:date_match.start()].replace(rec['순위번호'], '', 1).strip()
+                                action_strip_pattern = r'^번\s*|(?:전부)?근저당권설정$|가압류$|임의경매개시결정$|강제경매개시결정$|압류$|경매개시결정$'
+                                clean_target = re.sub(action_strip_pattern, '', raw_target).strip()
+
+                                action = ""
+                                if '임의경매개시결정' in content: action = "임의경매개시결정"
+                                elif '강제경매개시결정' in content: action = "강제경매개시결정"
+                                elif '가압류' in content: action = "가압류"
+                                elif '근저당권설정' in content: action = "전부근저당권설정" if '전부근저당권설정' in content else "근저당권설정"
+                                elif '압류' in content: action = "압류"
+                                if action and action in clean_target:
+                                    rec['등기목적'] = clean_target
+                                else:
+                                    rec['등기목적'] = f"{clean_target} {action}".strip()
+                            else:
+                                rec['접수일자_표시'], rec['등기목적'] = "확인불가", "확인불가"
+
+                            rec['말소후보'] = any(kw in content for kw in base_keywords)
+                            rec['절대인수'] = any(kw in content for kw in always_keep_keywords)
+                            rec['AI해석필요'] = any(kw in content for kw in ai_check_keywords)
+                            rec['소유권이전'] = '이전' in content and not rec['말소후보'] and not rec['절대인수']
+
+                            purpose_text = rec.get('등기목적', '')
+                            malso_purpose_kws = ['말소', '抹消', '취소', '해지', '해제']
+                            has_malso_in_purpose = any(mk in purpose_text for mk in malso_purpose_kws)
+                            malso_combined = ['근저당권말소', '가압류말소', '압류말소', '경매개시결정말소',
+                                              '저당권말소', '담보가등기말소', '전세권말소', '근저당말소']
+                            has_malso_combined = any(mc in content for mc in malso_combined)
+                            rec['이미말소됨'] = has_malso_in_purpose or has_malso_combined
+
                             receipt_match = re.search(r'제\s*(\d+)\s*호', rec['전체내용'])
-                            rec['접수일자_표시'] = f"{y}년 {m}월 {d}일" + (f" 제{receipt_match.group(1)}호" if receipt_match else "")
-                            
-                            raw_target = rec['전체내용'][:date_match.start()].replace(rec['순위번호'], '', 1).strip()
-                            # 등기목적 키워드를 완전한 형태로 제거 (중복 방지)
-                            action_strip_pattern = r'^번\s*|(?:전부)?근저당권설정$|가압류$|임의경매개시결정$|강제경매개시결정$|압류$|경매개시결정$'
-                            clean_target = re.sub(action_strip_pattern, '', raw_target).strip()
-                            
-                            action = ""
-                            if '임의경매개시결정' in content: action = "임의경매개시결정"
-                            elif '강제경매개시결정' in content: action = "강제경매개시결정"
-                            elif '가압류' in content: action = "가압류"
-                            elif '근저당권설정' in content: action = "전부근저당권설정" if '전부근저당권설정' in content else "근저당권설정"
-                            elif '압류' in content: action = "압류"
-                            # ✅ 중복 방지: clean_target에 이미 action이 포함되어 있으면 action 추가 안 함
-                            if action and action in clean_target:
-                                rec['등기목적'] = clean_target
-                            else:
-                                rec['등기목적'] = f"{clean_target} {action}".strip()
-                        else:
-                            rec['접수일자_표시'], rec['등기목적'] = "확인불가", "확인불가"
+                            rec['접수번호_오타'] = ""
+                            if receipt_match:
+                                receipt_num = receipt_match.group(1)
+                                if len(receipt_num) <= 1 or len(receipt_num) >= 8:
+                                    rec['접수번호_오타'] = f"⚠️ 접수번호 '{receipt_num}'이(가) 패턴상 오타로 보입니다. 원본 확인 필요."
+                            elif rec.get('접수일자_표시', '') != '확인불가' and '제' not in rec['전체내용']:
+                                rec['접수번호_오타'] = "⚠️ 접수번호(제____호)가 인식되지 않았습니다. 원본 확인 필요."
 
-                        rec['말소후보'] = any(kw in content for kw in base_keywords)
-                        rec['절대인수'] = any(kw in content for kw in always_keep_keywords)
-                        rec['AI해석필요'] = any(kw in content for kw in ai_check_keywords)
-                        rec['소유권이전'] = '이전' in content and not rec['말소후보'] and not rec['절대인수']
+                            _parsed.append(rec)
+                        return _parsed
 
-                        # 🔍 '이미 말소됨' 감지: 등기목적에 '말소' 표현이 포함된 경우만 판정
-                        # 근저당권말소, 가압류말소 등 → 이미 처리된 말소등기
-                        purpose_text = rec.get('등기목적', '')
-                        malso_purpose_kws = ['말소', '抹消', '취소', '해지', '해제']
-                        has_malso_in_purpose = any(mk in purpose_text for mk in malso_purpose_kws)
-                        # OCR 전체 텍스트에서 복합 키워드 감지 (근저당권말소 등)
-                        malso_combined = ['근저당권말소', '가압류말소', '압류말소', '경매개시결정말소',
-                                          '저당권말소', '담보가등기말소', '전세권말소', '근저당말소']
-                        has_malso_combined = any(mc in content for mc in malso_combined)
-                        rec['이미말소됨'] = has_malso_in_purpose or has_malso_combined
-                        
-                        # 📝 접수번호 OCR 오타 감지: '제XXXX호' 패턴 검증
-                        receipt_match = re.search(r'제\s*(\d+)\s*호', rec['전체내용'])
-                        rec['접수번호_오타'] = ""
-                        if receipt_match:
-                            receipt_num = receipt_match.group(1)
-                            # 비정상적 접수번호 감지 (자릿수 1자리 이하이거나 8자리 이상)
-                            if len(receipt_num) <= 1 or len(receipt_num) >= 8:
-                                rec['접수번호_오타'] = f"⚠️ 접수번호 '{receipt_num}'이(가) 패턴상 오타로 보입니다. 원본 확인 필요."
-                        elif rec.get('접수일자_표시', '') != '확인불가' and '제' not in rec['전체내용']:
-                            rec['접수번호_오타'] = "⚠️ 접수번호(제____호)가 인식되지 않았습니다. 원본 확인 필요."
-                        
-                        parsed_records.append(rec)
+                    # 1차 시도: 분류된 analysis_rows로 파싱
+                    parsed_records = parse_records_from_rows(analysis_rows)
+
+                    # 🛡️ Fallback: 파싱 실패 시 원본 OCR 텍스트로 재시도
+                    if not parsed_records and analysis_rows != original_clean_rows:
+                        st.toast('🔄 분류 결과로 인식 실패 — 원본 텍스트로 재시도합니다...')
+                        parsed_records = parse_records_from_rows(original_clean_rows)
 
                     # 📊 빈 데이터 방지 (등기부 아닌 사진 업로드 시)
                     if not parsed_records:
