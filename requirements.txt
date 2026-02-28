@@ -5,3 +5,6 @@ google-generativeai
 python-docx
 opencv-python-headless
 numpy
+Pillow
+fpdf2
+plotly

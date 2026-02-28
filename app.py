@@ -5,6 +5,7 @@ import time
 import json
 import hashlib
 import re
+import os
 import pandas as pd
 import datetime
 import numpy as np
@@ -13,6 +14,8 @@ import google.generativeai as genai
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from io import BytesIO
+from PIL import Image
+import plotly.graph_objects as go
 
 # =====================================================================
 # 🎨 1. 스트림릿 기본 설정 & 2030 타겟 감성 디자인 (CSS)
@@ -113,7 +116,53 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # =====================================================================
-# 🖼️ 이미지 전처리 함수 (OpenCV)
+# � 이미지 자동 압축 함수 (Pillow) — 8MB+ 고해상도 사진 메모리 오류 방지
+# =====================================================================
+def compress_and_preprocess(file_bytes, max_width=1500, jpeg_quality=80):
+    """Pillow를 사용하여 고해상도 이미지를 압축합니다.
+    1) 너비가 max_width(기본 1500px)을 초과하면 비율 유지 리사이징
+    2) JPEG 품질 jpeg_quality(기본 80)로 압축
+    3) EXIF 회전 정보 자동 적용 (스마트폰 사진 대응)
+    → 압축된 JPEG 바이트를 반환하여 네이버 OCR로 전송
+    """
+    try:
+        img = Image.open(BytesIO(file_bytes))
+
+        # EXIF 회전 정보 자동 적용 (스마트폰으로 찍은 사진의 방향 보정)
+        try:
+            from PIL import ImageOps
+            img = ImageOps.exif_transpose(img)
+        except Exception:
+            pass  # EXIF 정보가 없거나 처리 실패 시 무시
+
+        # 너비가 max_width를 초과하면 비율 유지 리사이징
+        if img.width > max_width:
+            ratio = max_width / img.width
+            new_height = int(img.height * ratio)
+            img = img.resize((max_width, new_height), Image.LANCZOS)
+
+        # RGBA → RGB 변환 (JPEG는 알파 채널 미지원)
+        if img.mode in ('RGBA', 'P', 'LA'):
+            background = Image.new('RGB', img.size, (255, 255, 255))
+            if img.mode == 'P':
+                img = img.convert('RGBA')
+            background.paste(img, mask=img.split()[-1] if 'A' in img.mode else None)
+            img = background
+        elif img.mode != 'RGB':
+            img = img.convert('RGB')
+
+        # JPEG 품질 80으로 압축
+        buffer = BytesIO()
+        img.save(buffer, format='JPEG', quality=jpeg_quality, optimize=True)
+        compressed_bytes = buffer.getvalue()
+
+        return compressed_bytes
+    except Exception:
+        # 압축 실패 시 원본 반환 (안전 장치)
+        return file_bytes
+
+# =====================================================================
+# �🖼️ 이미지 전처리 함수 (OpenCV)
 # =====================================================================
 def preprocess_image(file_bytes):
     """스마트폰으로 찍은 사진의 OCR 인식률을 향상시키기 위한 전처리 파이프라인.
@@ -465,6 +514,172 @@ def ask_gemini_for_rights(record_text, base_date, model, spec_summary=None):
     """
     return model.generate_content(prompt).text
 
+def ask_gemini_for_malso_omission(all_records_text, base_date, model, spec_summary=None):
+    """Gemini에게 '말소 누락' 특수 미션을 부여하여,
+    낙찰 후 말소되었어야 하는데 현재 살아있는 누락 건을 탐지합니다."""
+    spec_ref = ""
+    if spec_summary:
+        spec_ref = f"""
+    [매각물건명세서 참고 정보]
+    {spec_summary}
+        """
+
+    prompt = f"""
+    너는 대한민국 법원 경매 권리분석 최고 전문가이자 '말소 누락 탐지 전문가'야.
+    아래 등기부등본 전체 내용과 말소기준권리 일자를 바탕으로, **특수 미션**을 수행해 줘.
+
+    [🎯 특수 미션: 말소 누락 탐지]
+    경매 낙찰 후 말소촉탁으로 **말소되었어야 하는데, 현재 등기부에 여전히 살아있는 '말소 누락 건'**을 찾아줘.
+
+    [권리분석 규칙]
+    {knowledge_base}
+
+    [사건 기준 정보]
+    - 확정된 말소기준권리 일자: {base_date}
+    - 말소기준권리 일자 이후(같은 날 포함)에 접수된 근저당권, 가압류, 압류, 경매개시결정, 담보가등기 등은 낙찰로 소멸(말소)되어야 합니다.
+
+    [등기부등본 전체 내용]
+    {all_records_text}
+    {spec_ref}
+    [탐지 기준]
+    1. 말소기준권리 일자 이후에 접수된 등기 중, 말소 대상인데 OCR 텍스트에 '말소' 표시가 없거나 가로줄이 감지되지 않아 살아있는 것처럼 보이는 권리를 찾아줘.
+    2. 단, '건물철거 및 토지인도청구권 보전 가처분', '예고등기', '유치권', '법정지상권', '분묘기지권', '도시철도법 구분지상권', '채무자회생법 등기', '특별매각조건 인수 권리' 등 예외적으로 소멸하지 않는 권리는 말소 누락으로 판단하지 마.
+    3. 실제로 이미 말소된 등기(OCR 텍스트에 '말소' 단어가 포함되거나 취소선이 있는 경우)는 누락 건에서 제외해.
+
+    [출력 형식]
+    - 말소 누락 의심 건이 없으면: "✅ 말소 누락 의심 건 없음"
+    - 말소 누락 의심 건이 있으면 각 건에 대해:
+      "🚨 말소 누락 의심: [구분(갑구/을구)] 순위번호 [번호] - [등기목적] (접수일: [날짜])"
+      "   사유: [왜 말소되었어야 하는지 간략 설명]"
+    """
+    try:
+        return model.generate_content(prompt).text
+    except Exception:
+        return "말소 누락 탐지 분석 실패 (API 오류)"
+
+def ask_gemini_for_safety_report(df, base_date, model, spec_summary=None, parsed_records=None):
+    """전체 분석 결과를 바탕으로 Gemini에게 입찰 안전도 종합 의견을 요청합니다."""
+    # 인수 권리 요약 생성
+    insu_rows = df[df['결과'].str.contains('인수', na=False) & ~df['결과'].str.contains('이미', na=False)]
+    malso_rows = df[df['결과'].str.contains('말소', na=False) & ~df['결과'].str.contains('이미', na=False)]
+    danger_rows = df[df['결과'].str.contains('절대 인수', na=False)]
+    warning_rows = df[df['결과'].str.contains('서류확인', na=False)]
+
+    insu_summary = "\n".join(
+        [f"  - {r['구분']} 순위번호 {r['순위번호']}: {r['등기목적']}" for _, r in insu_rows.iterrows()]
+    ) if not insu_rows.empty else "  없음"
+
+    danger_summary = "\n".join(
+        [f"  - {r['구분']} 순위번호 {r['순위번호']}: {r['등기목적']}" for _, r in danger_rows.iterrows()]
+    ) if not danger_rows.empty else "  없음"
+
+    # 채권액 추출 시도 (근저당권 금액)
+    amount_info = ""
+    if parsed_records:
+        amounts = []
+        for rec in parsed_records:
+            content = rec.get('전체내용', '')
+            # 채권최고액, 금 XXX원 패턴
+            amt_matches = re.findall(r'(?:채권최고액|금)\s*([\d,]+)\s*원', content.replace(' ', ''))
+            for amt in amt_matches:
+                try:
+                    amounts.append(int(amt.replace(',', '')))
+                except ValueError:
+                    pass
+        if amounts:
+            total_amt = sum(amounts)
+            amount_info = f"\n  - 감지된 채권최고액 합계: 약 {total_amt:,}원 ({len(amounts)}건)"
+
+    spec_ref = ""
+    if spec_summary:
+        spec_ref = f"\n[매각물건명세서 분석 결과]\n{spec_summary}"
+
+    prompt = f"""
+    너는 대한민국 법원 경매 권리분석 최고 전문가이자 투자 리스크 평가 전문가야.
+    아래 분석 결과를 바탕으로 "이 물건에 입찰해도 안전한지" 종합 의견을 줘.
+
+    [분석 기준 정보]
+    - 말소기준권리 일자: {base_date}
+    - 총 등기 건수: {len(df)}건
+    - 말소 예정: {len(malso_rows)}건
+    - 인수 예정: {len(insu_rows)}건
+    - 절대 인수 (위험): {len(danger_rows)}건
+    - 서류확인 필요: {len(warning_rows)}건{amount_info}
+
+    [인수되는 권리 목록]
+{insu_summary}
+
+    [절대 인수 (위험 권리) 목록]
+{danger_summary}
+    {spec_ref}
+    [지시사항]
+    1. 위험도 등급을 반드시 첫 줄에 표시해: "🟢 안전", "🟡 주의", "🔴 위험" 중 하나.
+       - 🟢 안전: 인수되는 위험 권리 없음, 말소 누락 없음
+       - 🟡 주의: 인수 권리 있으나 금액이 크지 않거나, 서류확인 필요 건이 있음
+       - 🔴 위험: 절대 인수 권리 존재, 유치권/건물철거/법정지상권 등 중대 위험
+    2. 두 번째 줄부터 간결한 종합 의견 (3~5줄):
+       - 인수되는 채권의 총 부담 추정액
+       - 핵심 위험 요소 요약
+       - 입찰 시 주의사항
+    3. 마지막에 "💡 입찰팁: " 으로 시작하는 실용적 조언 1줄 추가.
+    """
+    try:
+        return model.generate_content(prompt).text
+    except Exception:
+        return "종합 안전도 리포트 생성 실패 (API 오류)"
+
+
+def merge_and_sort_pages(sorted_files, ocr_cache):
+    """여러 장의 등기부등본 페이지를 갑구/을구 섹션 기반으로 자동 정렬합니다.
+    페이지 순서가 섞여 있어도 표제부→갑구→을구 순서로 올바르게 재배열합니다."""
+    section_keywords = {
+        '표제부': ['표제부', '건물의표시', '토지의표시', '대지권의목적', '1동의건물의표시'],
+        '갑구': ['갑구', '소유권에관한사항'],
+        '을구': ['을구', '소유권이외의권리']
+    }
+
+    pages_info = []
+    for file in sorted_files:
+        raw_bytes = file.getvalue()
+        file_hash = hashlib.sha256(raw_bytes).hexdigest()
+        if file_hash not in ocr_cache:
+            continue
+        page_rows = ocr_cache[file_hash]
+        page_text = ' '.join(page_rows).replace(' ', '')
+
+        # 섹션 감지
+        detected_section = None
+        section_priority = {'표제부': 0, '갑구': 1, '을구': 2}
+        for section, keywords in section_keywords.items():
+            for kw in keywords:
+                if kw in page_text:
+                    if detected_section is None or section_priority[section] < section_priority.get(detected_section, 99):
+                        detected_section = section
+                    break
+
+        # 순위번호 추출 (연속성 판단용)
+        rank_numbers = re.findall(r'(?:^|\s)([1-9]\d{0,2})\s', ' '.join(page_rows))
+        first_rank = int(rank_numbers[0]) if rank_numbers else 999
+
+        pages_info.append({
+            'file': file,
+            'hash': file_hash,
+            'section': detected_section or '갑구',  # 기본값: 갑구
+            'first_rank': first_rank,
+            'rows': page_rows
+        })
+
+    # 정렬: 표제부 → 갑구 → 을구, 같은 섹션 내에서는 순위번호 순
+    section_order = {'표제부': 0, '갑구': 1, '을구': 2}
+    pages_info.sort(key=lambda p: (section_order.get(p['section'], 1), p['first_rank']))
+
+    # 정렬된 rows 반환
+    merged_rows = []
+    for page in pages_info:
+        merged_rows.extend(page['rows'])
+
+    return merged_rows
+
 # =====================================================================
 # 🔄 4. 화면 자동 전환 로직 (세션 상태 관리)
 # =====================================================================
@@ -478,8 +693,16 @@ if 'ocr_cache' not in st.session_state:
     st.session_state.ocr_cache = {}  # 💰 OCR 결과 캐시 (key: 파일 해시)
 if 'spec_summary' not in st.session_state:
     st.session_state.spec_summary = None  # 📋 매각물건명세서 요약
+if 'malso_omission_report' not in st.session_state:
+    st.session_state.malso_omission_report = None  # 🔍 말소 누락 탐지 보고서
 if 'danger_warnings' not in st.session_state:
     st.session_state.danger_warnings = []  # 🚨 위험 경고 목록
+if 'base_date_info' not in st.session_state:
+    st.session_state.base_date_info = None  # 📅 말소기준권리 상세 정보
+if 'compression_log' not in st.session_state:
+    st.session_state.compression_log = []  # 📦 이미지 압축 로그
+if 'safety_report' not in st.session_state:
+    st.session_state.safety_report = None  # 🧾 종합 안전도 리포트
 
 # =====================================================================
 # 📱 [1단계 화면] 메인 화면 및 사진 업로드
@@ -504,74 +727,119 @@ if st.session_state.step == 1:
                     return [int(c) if c.isdigit() else c.lower()
                             for c in re.split(r'(\d+)', f.name)]
 
-                with st.spinner('문서를 스캔하고 있습니다... (약 10~20초)'):
-                    all_clean_rows = []
-                    cache_hit_count = 0
-                    for file in sorted(uploaded_files, key=natural_sort_key):
-                        raw_bytes = file.getvalue()
+                # 📊 진행률 표시 OCR 스캔
+                all_clean_rows = []
+                cache_hit_count = 0
+                total_files = len(uploaded_files)
+                sorted_files = sorted(uploaded_files, key=natural_sort_key)
+                compression_log = []
+                progress_bar = st.progress(0, text='📸 문서 스캔 준비 중...')
 
-                        # 💰 OCR 캐싱: 파일 해시로 중복 체크
-                        file_hash = hashlib.sha256(raw_bytes).hexdigest()
-                        if file_hash in st.session_state.ocr_cache:
-                            all_clean_rows.extend(st.session_state.ocr_cache[file_hash])
-                            cache_hit_count += 1
+                for file_idx, file in enumerate(sorted_files):
+                    progress_bar.progress((file_idx) / total_files, text=f'📸 스캔 중 ({file_idx + 1}/{total_files}): {file.name}')
+                    raw_bytes = file.getvalue()
+
+                    # 💰 OCR 캐싱: 파일 해시로 중복 체크 (부분 재분석 지원)
+                    file_hash = hashlib.sha256(raw_bytes).hexdigest()
+                    if file_hash in st.session_state.ocr_cache:
+                        all_clean_rows.extend(st.session_state.ocr_cache[file_hash])
+                        cache_hit_count += 1
+                        continue
+
+                    # 📦 Step 1: Pillow로 이미지 압축 (1500px, JPEG Q80)
+                    compressed_bytes = compress_and_preprocess(raw_bytes)
+                    original_kb = len(raw_bytes) / 1024
+                    compressed_kb = len(compressed_bytes) / 1024
+                    if original_kb > 500:
+                        compression_log.append(
+                            f"📦 {file.name}: {original_kb/1024:.1f}MB → {compressed_kb/1024:.1f}MB ({(1 - compressed_kb/original_kb)*100:.0f}% 절감)"
+                        )
+
+                    # 🖼️ Step 2: OpenCV로 OCR 전처리
+                    file_bytes = preprocess_image(compressed_bytes)
+                    request_json = {'images': [{'format': 'png', 'name': 'demo'}], 'requestId': str(uuid.uuid4()), 'version': 'V2', 'timestamp': int(round(time.time() * 1000))}
+                    payload = {'message': json.dumps(request_json).encode('UTF-8')}
+                    headers = {'X-OCR-SECRET': NAVER_SECRET_KEY}
+
+                    # 🔄 네이버 OCR API 호출 (timeout 30초 + 재시도 2회)
+                    response = None
+                    for attempt in range(3):
+                        # Bug 5 fix: 매 시도마다 file_data 재생성 (read pointer 리셋)
+                        file_data = [('file', (file.name, file_bytes, 'image/png'))]
+                        try:
+                            response = requests.post(
+                                NAVER_API_URL, headers=headers, data=payload,
+                                files=file_data, timeout=30
+                            )
+                            if response.status_code == 200:
+                                break
+                            elif response.status_code == 429 and attempt < 2:
+                                time.sleep(2 ** attempt)
+                                continue
+                        except requests.exceptions.Timeout:
+                            if attempt < 2:
+                                time.sleep(2)
+                                continue
+                            else:
+                                st.error(f"⏱️ OCR 응답 시간 초과: {file.name}")
+                                st.stop()
+                        except requests.exceptions.RequestException as e:
+                            st.error(f"🌐 네트워크 오류: {e}")
+                            st.stop()
+
+                    if response and response.status_code == 200:
+                        images_data = response.json().get('images', [])
+                        fields = images_data[0].get('fields', []) if images_data else []
+                        if not fields:
+                            st.warning(f"⚠️ {file.name}에서 텍스트가 감지되지 않았습니다.")
                             continue
 
-                        # 🖼️ 이미지 전처리: 그레이스케일 + 이진화 + 기울기 보정
-                        file_bytes = preprocess_image(raw_bytes)
-                        request_json = {'images': [{'format': 'png', 'name': 'demo'}], 'requestId': str(uuid.uuid4()), 'version': 'V2', 'timestamp': int(round(time.time() * 1000))}
-                        payload = {'message': json.dumps(request_json).encode('UTF-8')}
-                        file_data = [('file', (file.name, file_bytes, 'image/png'))]
-                        headers = {'X-OCR-SECRET': NAVER_SECRET_KEY}
-                        
-                        response = requests.request("POST", NAVER_API_URL, headers=headers, data=payload, files=file_data)
-                        if response.status_code == 200:
-                            fields = response.json()['images'][0]['fields']
-                            current_row, last_y, page_rows = [], -1, []
-                            sorted_fields = sorted(fields, key=lambda x: x['boundingPoly']['vertices'][0]['y'])
+                        current_row, last_y, page_rows = [], -1, []
+                        sorted_fields = sorted(fields, key=lambda x: x['boundingPoly']['vertices'][0]['y'])
 
-                            for field in sorted_fields:
-                                text = field['inferText']
-                                y_pos = field['boundingPoly']['vertices'][0]['y']
-                                x_pos = field['boundingPoly']['vertices'][0]['x']
-                                text = re.sub(r'(\d{6})\s*-\s*\d{7}', r'\1-*******', text) 
+                        for field in sorted_fields:
+                            text = field['inferText']
+                            y_pos = field['boundingPoly']['vertices'][0]['y']
+                            x_pos = field['boundingPoly']['vertices'][0]['x']
+                            text = re.sub(r'(\d{6})\s*-\s*\d{7}', r'\1-*******', text)
 
-                                if last_y == -1 or abs(y_pos - last_y) <= 20:
-                                    current_row.append({'x': x_pos, 'text': text})
-                                else:
-                                    current_row.sort(key=lambda x: x['x'])
-                                    page_rows.append(" ".join([item['text'] for item in current_row]))
-                                    current_row = [{'x': x_pos, 'text': text}]
-                                last_y = y_pos
-
-                            if current_row:
+                            if last_y == -1 or abs(y_pos - last_y) <= 20:
+                                current_row.append({'x': x_pos, 'text': text})
+                            else:
                                 current_row.sort(key=lambda x: x['x'])
                                 page_rows.append(" ".join([item['text'] for item in current_row]))
-                            
-                            # 💰 OCR 결과 캐시 저장
-                            st.session_state.ocr_cache[file_hash] = page_rows
-                            all_clean_rows.extend(page_rows)
-                        else:
-                            st.error("OCR 스캔 중 오류가 발생했습니다.")
-                            st.stop()
-                    
-                    if cache_hit_count > 0:
-                        st.toast(f'💰 {cache_hit_count}개 파일은 이전 스캔 결과를 재사용했습니다 (비용 절감!)')
+                                current_row = [{'x': x_pos, 'text': text}]
+                            last_y = y_pos
+
+                        if current_row:
+                            current_row.sort(key=lambda x: x['x'])
+                            page_rows.append(" ".join([item['text'] for item in current_row]))
+
+                        st.session_state.ocr_cache[file_hash] = page_rows
+                        all_clean_rows.extend(page_rows)
+                    else:
+                        status = response.status_code if response else 'No response'
+                        st.error(f"OCR 스캔 실패 ({file.name}): HTTP {status}")
+                        st.stop()
+
+                progress_bar.progress(1.0, text='✅ OCR 스캔 완료!')
+                st.session_state.compression_log = compression_log
+
+                if cache_hit_count > 0:
+                    st.toast(f'💰 {cache_hit_count}개 파일은 이전 스캔 결과를 재사용했습니다 (부분 재분석 · 비용 절감!)')
+                for log_msg in compression_log:
+                    st.toast(log_msg)
+
+
+                # 📷 Feature C: 여러 장 등기부 페이지 연결 — 갑구/을구 자동 정렬
+                if total_files > 1:
+                    merged_rows = merge_and_sort_pages(sorted_files, st.session_state.ocr_cache)
+                    if merged_rows:
+                        all_clean_rows = merged_rows
+                        st.toast('📷 여러 페이지가 갑구/을구 순서로 자동 정렬되었습니다!')
 
                 # 📋 문서 분류: 등기부등본 vs 매각물건명세서 자동 분리
                 registry_rows, spec_rows = [], []
-                # 페이지 단위로 키워드 스코어링 (각 파일의 OCR 결과를 구분)
-                page_start = 0
-                file_page_counts = []
-                for file in sorted(uploaded_files, key=natural_sort_key):
-                    raw_bytes = file.getvalue()
-                    file_hash = hashlib.sha256(raw_bytes).hexdigest()
-                    if file_hash in st.session_state.ocr_cache:
-                        page_count = len(st.session_state.ocr_cache[file_hash])
-                    else:
-                        # 이미 all_clean_rows에 추가된 행수 계산
-                        page_count = 0  # 캐시 미스 시 이전 루프에서 이미 처리됨
-                    file_page_counts.append(page_count)
 
                 # 파일별이 아닌 전체 텍스트 기반으로 분류 (더 정확)
                 full_text = " ".join(all_clean_rows)
@@ -636,8 +904,8 @@ if st.session_state.step == 1:
                         if any(kw in clean_row for kw in ignore_keywords):
                             continue
                             
-                        if "갑구" in clean_row and "소유권" in clean_row: current_gu = "갑구"; continue
-                        if "을구" in clean_row and "소유권" in clean_row: current_gu = "을구"; continue
+                        if "갑구" in clean_row and ("소유권" in clean_row or "관한사항" in clean_row): current_gu = "갑구"; continue
+                        if "을구" in clean_row and ("소유권" in clean_row or "관한사항" in clean_row or "이외의권리" in clean_row): current_gu = "을구"; continue
                         if current_gu is None or "순위번호" in row or "등기목적" in row or "접수" in row: continue
 
                         match = rank_pattern.match(row)
@@ -704,6 +972,17 @@ if st.session_state.step == 1:
                         rec['절대인수'] = any(kw in content for kw in always_keep_keywords)
                         rec['AI해석필요'] = any(kw in content for kw in ai_check_keywords)
                         rec['소유권이전'] = '이전' in content and not rec['말소후보'] and not rec['절대인수']
+
+                        # 🔍 '이미 말소됨' 감지: 등기목적에 '말소' 표현이 포함된 경우만 판정
+                        # 근저당권말소, 가압류말소 등 → 이미 처리된 말소등기
+                        purpose_text = rec.get('등기목적', '')
+                        malso_purpose_kws = ['말소', '抹消', '취소', '해지', '해제']
+                        has_malso_in_purpose = any(mk in purpose_text for mk in malso_purpose_kws)
+                        # OCR 전체 텍스트에서 복합 키워드 감지 (근저당권말소 등)
+                        malso_combined = ['근저당권말소', '가압류말소', '압류말소', '경매개시결정말소',
+                                          '저당권말소', '담보가등기말소', '전세권말소', '근저당말소']
+                        has_malso_combined = any(mc in content for mc in malso_combined)
+                        rec['이미말소됨'] = has_malso_in_purpose or has_malso_combined
                         
                         # 📝 접수번호 OCR 오타 감지: '제XXXX호' 패턴 검증
                         receipt_match = re.search(r'제\s*(\d+)\s*호', rec['전체내용'])
@@ -718,11 +997,30 @@ if st.session_state.step == 1:
                         
                         parsed_records.append(rec)
 
+                    # 📊 빈 데이터 방지 (등기부 아닌 사진 업로드 시)
+                    if not parsed_records:
+                        st.warning("⚠️ 등기부등본 내용을 인식하지 못했습니다. 사진을 확인해 주세요.")
+                        st.stop()
+
                     df = pd.DataFrame(parsed_records)
                     candidates = df[df['말소후보'] == True].dropna(subset=['접수일자_기준'])
                     base_date = candidates.sort_values(by='접수일자_기준').iloc[0]['접수일자_기준'] if not candidates.empty else None
 
+                    # 📅 말소기준권리 정보 저장 (시각적 표시용)
+                    base_date_info = None
+                    if not candidates.empty:
+                        first_candidate = candidates.sort_values(by='접수일자_기준').iloc[0]
+                        base_date_info = {
+                            'date': base_date,
+                            'purpose': first_candidate.get('등기목적', ''),
+                            'gu': first_candidate.get('구분', ''),
+                            'rank': first_candidate.get('순위번호', ''),
+                        }
+                    st.session_state.base_date_info = base_date_info
+
                     def determine_status(row):
+                        # 🔍 최우선: 이미 말소된 권리는 별도 분류 (가로줄 그어진 등기)
+                        if row.get('이미말소됨', False): return "🔘 이미 말소됨"
                         if row['절대인수']: return "🚨 절대 인수"
                         elif row['AI해석필요']: return "🤖 AI 정밀해석"
                         elif row['소유권이전']: return "➖ 기본등기"
@@ -732,30 +1030,62 @@ if st.session_state.step == 1:
 
                     df['결과'] = df.apply(determine_status, axis=1)
 
-                with st.spinner('Gemini AI가 복잡한 권리를 정밀 해석 중입니다...'):
-                    df['AI_상세이유'] = ""
-                    for index, row in df.iterrows():
-                        if "🤖 AI 정밀해석" in str(row['결과']):
+                # 🤖 Gemini AI 정밀 해석 (진행률 + 지수 백오프)
+                ai_targets = df[df['결과'].str.contains('AI 정밀해석')].index.tolist()
+                df['AI_상세이유'] = ""
+                if ai_targets:
+                    ai_progress = st.progress(0, text='🤖 AI 정밀 해석 준비 중...')
+                    for ai_idx, index in enumerate(ai_targets):
+                        row = df.loc[index]
+                        ai_progress.progress((ai_idx) / len(ai_targets), text=f'🤖 AI 해석 중 ({ai_idx + 1}/{len(ai_targets)})')
+                        max_retries = 3
+                        for attempt in range(max_retries):
                             try:
                                 ai_answer = ask_gemini_for_rights(row['전체내용'], base_date, model, spec_summary)
                                 if "결과: 인수" in ai_answer: df.at[index, '결과'] = "✅ 인수 (AI판단)"
                                 elif "결과: 말소" in ai_answer: df.at[index, '결과'] = "❌ 말소 (AI판단)"
                                 elif "결과: 추가확인" in ai_answer: df.at[index, '결과'] = "⚠️ 서류확인 요망"
-                                
                                 df.at[index, 'AI_상세이유'] = ai_answer.split("이유:")[-1].strip() if "이유:" in ai_answer else ai_answer
                                 time.sleep(1)
+                                break
                             except Exception as e:
-                                df.at[index, 'AI_상세이유'] = "API 통신 오류"
+                                if attempt < max_retries - 1:
+                                    time.sleep(2 ** attempt)
+                                else:
+                                    df.at[index, 'AI_상세이유'] = "API 통신 오류 (재시도 실패)"
+                    ai_progress.progress(1.0, text='✅ AI 해석 완료!')
 
-                    malso_df = df[df['결과'].str.contains('말소')][['구분', '순위번호', '등기목적', '접수일자_표시']]
-                    malso_df.columns = ['구분', '순위번호', '등기목적', '접수일자']
-                    malso_df.index = range(1, len(malso_df) + 1)
+                # 🔍 Gemini 말소 누락 탐지 특수 미션 수행 (Bug 2 fix: if ai_targets 블록 바깥으로 이동)
+                malso_omission_report = None
+                if base_date and len(parsed_records) > 0:
+                    with st.spinner('🔍 Gemini가 말소 누락 건을 탐지하고 있습니다...'):
+                        all_records_text = "\n".join([r['전체내용'] for r in parsed_records])
+                        malso_omission_report = ask_gemini_for_malso_omission(
+                            all_records_text, base_date, model, spec_summary
+                        )
+                st.session_state.malso_omission_report = malso_omission_report
 
-                    st.session_state.final_df = df
-                    st.session_state.malso_df = malso_df
-                    
-                    st.session_state.step = 2
-                    st.rerun()
+                # '이미 말소됨' 항목은 말소 목록에서 제외 (이미 처리된 건이므로)
+                malso_df = df[
+                    df['결과'].str.contains('말소') & ~df['결과'].str.contains('이미 말소됨')
+                ][['구분', '순위번호', '등기목적', '접수일자_표시']]
+                malso_df.columns = ['구분', '순위번호', '등기목적', '접수일자']
+                malso_df.index = range(1, len(malso_df) + 1)
+
+                st.session_state.final_df = df
+                st.session_state.malso_df = malso_df
+
+                # 🧾 Feature A: Gemini 종합 안전도 리포트 생성
+                safety_report = None
+                if base_date:
+                    with st.spinner('🧾 Gemini가 종합 안전도를 평가하고 있습니다...'):
+                        safety_report = ask_gemini_for_safety_report(
+                            df, base_date, model, spec_summary, parsed_records
+                        )
+                st.session_state.safety_report = safety_report
+
+                st.session_state.step = 2
+                st.rerun()
 
             except Exception as e:
                 st.error(f"분석 중 오류가 발생했습니다: {e}")
@@ -775,6 +1105,130 @@ if st.session_state.step == 1:
 elif st.session_state.step == 2:
     st.title("✨ 분석이 완료되었습니다!")
 
+    # 📊 분석 요약 대시보드
+    if st.session_state.final_df is not None:
+        result_df = st.session_state.final_df
+        total = len(result_df)
+        insu_count = len(result_df[result_df['결과'].str.contains('인수', na=False) & ~result_df['결과'].str.contains('이미|절대', na=False)])
+        malso_count = len(result_df[result_df['결과'].str.contains('말소', na=False) & ~result_df['결과'].str.contains('이미', na=False)])
+        already_count = len(result_df[result_df['결과'].str.contains('이미 말소됨', na=False)])
+        ai_count = len(result_df[result_df['결과'].str.contains('서류확인|AI판단', na=False, regex=True)])
+        danger_count = len(result_df[result_df['결과'].str.contains('절대 인수', na=False)])
+
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("📋 총 등기", f"{total}건")
+        col2.metric("✅ 인수", f"{insu_count}건")
+        col3.metric("❌ 말소", f"{malso_count}건")
+        col4.metric("🔘 이미말소", f"{already_count}건")
+
+        if danger_count > 0 or ai_count > 0:
+            col5, col6 = st.columns(2)
+            if danger_count > 0:
+                col5.metric("🚨 절대 인수", f"{danger_count}건")
+            if ai_count > 0:
+                col6.metric("🤖 AI 판단", f"{ai_count}건")
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+    # 📅 말소기준권리 일자 시각적 강조
+    if st.session_state.base_date_info:
+        bdi = st.session_state.base_date_info
+        st.info(f"📅 **말소기준권리**: {bdi['date']}  |  {bdi['gu']} 순위번호 {bdi['rank']}번  |  {bdi['purpose']}\n\n이 날짜 이후(같은 날 포함)에 접수된 말소 대상 등기는 낙찰로 소멸됩니다.")
+        st.markdown("<br>", unsafe_allow_html=True)
+
+    # 🧾 Feature A: 종합 안전도 리포트
+    if st.session_state.safety_report:
+        with st.expander("🧾 종합 안전도 리포트 (Gemini 평가)", expanded=True):
+            report = st.session_state.safety_report
+            # 위험도 등급에 따른 색상 표시
+            if '🟢' in report:
+                st.success(report)
+            elif '🔴' in report:
+                st.error(report)
+            else:
+                st.warning(report)
+        st.markdown("<br>", unsafe_allow_html=True)
+
+    # 📊 Feature B: 권리 타임라인 시각화
+    if st.session_state.final_df is not None:
+        timeline_df = st.session_state.final_df.dropna(subset=['접수일자_기준']).copy()
+        if not timeline_df.empty:
+            with st.expander("📊 권리 타임라인 시각화", expanded=True):
+                # 색상 매핑
+                color_map = {
+                    '인수': '#2ecc71',
+                    '말소': '#e74c3c',
+                    '절대 인수': '#e67e22',
+                    '이미 말소됨': '#95a5a6',
+                    'AI판단': '#3498db',
+                    '서류확인': '#f39c12',
+                    '기본등기': '#bdc3c7',
+                    '기타': '#7f8c8d',
+                }
+
+                def get_color(result):
+                    for key, color in color_map.items():
+                        if key in result:
+                            return color
+                    return '#7f8c8d'
+
+                timeline_df['색상'] = timeline_df['결과'].apply(get_color)
+                # 구분을 숫자로 (갑구=1, 을구=2)
+                timeline_df['Y축'] = timeline_df['구분'].apply(lambda x: 1 if '갑' in x else 2)
+
+                fig = go.Figure()
+
+                # 등기 포인트
+                for _, row in timeline_df.iterrows():
+                    fig.add_trace(go.Scatter(
+                        x=[row['접수일자_기준']],
+                        y=[row['Y축']],
+                        mode='markers+text',
+                        marker=dict(size=14, color=row['색상'], line=dict(width=1, color='white')),
+                        text=[str(row['순위번호'])],
+                        textposition='top center',
+                        textfont=dict(size=9),
+                        hovertext=f"{row['구분']} #{row['순위번호']}<br>{row['등기목적']}<br>{row['결과']}",
+                        hoverinfo='text',
+                        showlegend=False,
+                    ))
+
+                # 말소기준권리 수직선
+                if st.session_state.base_date_info:
+                    bd = st.session_state.base_date_info['date']
+                    fig.add_vline(
+                        x=bd, line_dash='dash', line_color='red', line_width=2,
+                        annotation_text='📌 말소기준권리',
+                        annotation_position='top',
+                        annotation_font_color='red',
+                    )
+
+                # 범례 (더미 트레이스)
+                for label, color in [('✅ 인수', '#2ecc71'), ('❌ 말소', '#e74c3c'),
+                                     ('🚨 절대인수', '#e67e22'), ('🔘 이미말소', '#95a5a6'),
+                                     ('🤖 AI판단', '#3498db')]:
+                    fig.add_trace(go.Scatter(
+                        x=[None], y=[None], mode='markers',
+                        marker=dict(size=10, color=color),
+                        name=label,
+                    ))
+
+                fig.update_layout(
+                    title='등기 접수일자 타임라인',
+                    xaxis_title='접수일자',
+                    yaxis=dict(
+                        tickvals=[1, 2],
+                        ticktext=['갑구 (소유권)', '을구 (기타권리)'],
+                        range=[0.5, 2.5],
+                    ),
+                    height=350,
+                    margin=dict(l=20, r=20, t=50, b=20),
+                    legend=dict(orientation='h', yanchor='bottom', y=-0.3, xanchor='center', x=0.5),
+                    plot_bgcolor='rgba(253,251,247,1)',
+                )
+                st.plotly_chart(fig, use_container_width=True)
+            st.markdown("<br>", unsafe_allow_html=True)
+
     # 🚨 매각물건명세서 위험 경고 (최상단에 표시)
     if st.session_state.danger_warnings:
         st.subheader("🚨 매각물건명세서 위험 경고")
@@ -788,10 +1242,11 @@ elif st.session_state.step == 2:
             st.info("📋 매각물건명세서가 감지되어 등기부등본과 교차 검증을 수행했습니다. AI 판단의 정확도가 향상되었습니다.")
             st.markdown(st.session_state.spec_summary)
         st.markdown("<br>", unsafe_allow_html=True)
-    
+
     st.subheader("📑 법원 제출용: 말소할 등기 목록")
     st.table(st.session_state.malso_df)
-    
+
+    # 📥 DOCX 문서 생성
     doc = Document()
     doc.add_heading('말 소 할  등 기  목 록', level=1).alignment = WD_ALIGN_PARAGRAPH.CENTER
     doc.add_paragraph()
@@ -805,22 +1260,83 @@ elif st.session_state.step == 2:
     doc_io = BytesIO()
     doc.save(doc_io)
     doc_io.seek(0)
-    
-    st.download_button(
-        label="📥 워드 문서(.docx) 다운로드",
-        data=doc_io,
-        file_name="말소할_등기_목록.docx",
-        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        type="primary",
-        use_container_width=True
-    )
+
+    # 📥 PDF 문서 생성
+    @st.cache_resource
+    def _get_pdf_font_path():
+        """PDF용 한글 폰트를 크로스플랫폼 temp 디렉토리에 캐시합니다."""
+        import tempfile
+        import urllib.request
+        font_path = os.path.join(tempfile.gettempdir(), 'NanumGothic-Regular.ttf')
+        if not os.path.exists(font_path):
+            urllib.request.urlretrieve(
+                'https://github.com/google/fonts/raw/main/ofl/nanumgothic/NanumGothic-Regular.ttf',
+                font_path
+            )
+        return font_path
+
+    def generate_pdf(malso_df):
+        try:
+            from fpdf import FPDF
+            font_path = _get_pdf_font_path()
+            pdf = FPDF()
+            pdf.add_page()
+            pdf.add_font('NanumGothic', '', font_path, uni=True)
+            pdf.set_font('NanumGothic', size=16)
+            pdf.cell(0, 12, '말 소 할  등 기  목 록', ln=True, align='C')
+            pdf.ln(8)
+            pdf.set_font('NanumGothic', size=11)
+            for idx, row in malso_df.iterrows():
+                pdf.cell(0, 8, f"{idx}. {row['구분']} 순위번호 제{row['순위번호']}번", ln=True)
+                pdf.cell(0, 7, f"   {row['등기목적']}", ln=True)
+                pdf.cell(0, 7, f"   {row['접수일자']} 접수", ln=True)
+                pdf.ln(4)
+            return bytes(pdf.output())
+        except Exception:
+            return None
+
+    # 📥 다운로드 버튼 (DOCX + PDF)
+    dl_col1, dl_col2 = st.columns(2)
+    with dl_col1:
+        st.download_button(
+            label="📥 워드(.docx) 다운로드",
+            data=doc_io,
+            file_name="말소할_등기_목록.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            type="primary",
+            use_container_width=True
+        )
+    with dl_col2:
+        pdf_data = generate_pdf(st.session_state.malso_df)
+        if pdf_data:
+            st.download_button(
+                label="📥 PDF 다운로드",
+                data=pdf_data,
+                file_name="말소할_등기_목록.pdf",
+                mime="application/pdf",
+                type="primary",
+                use_container_width=True
+            )
+        else:
+            st.caption("PDF 생성 불가 (fpdf2 미설치)")
 
     st.markdown("<br><hr><br>", unsafe_allow_html=True)
-    
+
+    # 🔍 말소 누락 탐지 보고서
+    if st.session_state.malso_omission_report:
+        with st.expander("🔍 말소 누락 탐지 결과 (Gemini 특수 미션)", expanded=True):
+            report = st.session_state.malso_omission_report
+            if "말소 누락 의심 건 없음" in report:
+                st.success(report)
+            else:
+                st.warning("⚠️ 아래 항목은 말소되었어야 하는데 현재 살아있는 것으로 의심되는 등기입니다. 원본 등기부를 반드시 확인하세요.")
+                st.markdown(report)
+        st.markdown("<br>", unsafe_allow_html=True)
+
     with st.expander("🤖 AI 상세 판독 내역 및 이유 보기 (클릭)"):
         display_cols = ['구분', '순위번호', '등기목적', '결과', 'AI_상세이유']
         st.dataframe(st.session_state.final_df[display_cols], use_container_width=True)
-        
+
         # 📝 접수번호 OCR 오타 경고 표시
         if '접수번호_오타' in st.session_state.final_df.columns:
             typo_rows = st.session_state.final_df[st.session_state.final_df['접수번호_오타'] != ''].copy()
@@ -829,9 +1345,14 @@ elif st.session_state.step == 2:
                 st.markdown("**📝 접수번호 OCR 오타 감지 결과**")
                 for _, row in typo_rows.iterrows():
                     st.warning(f"순위번호 {row['순위번호']}번: {row['접수번호_오타']}")
-    
+
     st.markdown("<br>", unsafe_allow_html=True)
-    
+
     if st.button("🔄 처음으로 돌아가기", use_container_width=True):
+        # 🔄 전체 세션 상태 초기화 (이전 결과 혼합 방지)
+        for key in ['final_df', 'malso_df', 'spec_summary', 'danger_warnings',
+                     'malso_omission_report', 'base_date_info', 'compression_log', 'safety_report']:
+            if key in st.session_state:
+                del st.session_state[key]
         st.session_state.step = 1
         st.rerun()
