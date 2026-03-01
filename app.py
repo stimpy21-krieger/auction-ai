@@ -1323,11 +1323,15 @@ if st.session_state.step == 1:
                             headers = {'X-OCR-SECRET': secret_key}
                             file_mime = 'image/png'
 
+                            # 파일명 확장자를 실제 포맷(png)에 맞춤 (확장자 불일치 → HTTP 400 방지)
+                            safe_filename = os.path.splitext(file_name)[0] + '.' + file_format
+
                             for attempt in range(3):
                                 form_data = aiohttp.FormData()
-                                form_data.add_field('message', json.dumps(request_json).encode('UTF-8'))
+                                # ⚠️ message는 반드시 문자열로 전송 (bytes로 보내면 aiohttp가 파일 업로드로 처리하여 API 400 에러 발생)
+                                form_data.add_field('message', json.dumps(request_json))
                                 form_data.add_field('file', preprocessed_bytes,
-                                                    filename=file_name,
+                                                    filename=safe_filename,
                                                     content_type=file_mime)
                                 try:
                                     async with session.post(api_url, headers=headers, data=form_data, timeout=aiohttp.ClientTimeout(total=30)) as resp:
@@ -1337,7 +1341,8 @@ if st.session_state.step == 1:
                                             await asyncio.sleep(2 ** attempt)
                                             continue
                                         else:
-                                            return {'status': 'error', 'code': resp.status, 'file_name': file_name}
+                                            error_body = await resp.text()
+                                            return {'status': 'error', 'code': resp.status, 'body': error_body, 'file_name': file_name}
                                 except asyncio.TimeoutError:
                                     if attempt < 2:
                                         await asyncio.sleep(2)
@@ -1373,7 +1378,8 @@ if st.session_state.step == 1:
                             st.error(f"🌐 네트워크 오류: {result.get('error', '')}")
                             st.stop()
                         elif result['status'] == 'error':
-                            st.error(f"OCR 스캔 실패 ({file_name}): HTTP {result.get('code', 'Unknown')}")
+                            error_detail = result.get('body', '')[:200]
+                            st.error(f"OCR 스캔 실패 ({file_name}): HTTP {result.get('code', 'Unknown')}\n{error_detail}")
                             st.stop()
 
                         # 성공 처리
