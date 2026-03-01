@@ -558,6 +558,12 @@ def ask_gemini_for_rights_batch(ai_rows_data, base_date, model, spec_summary=Non
     if spec_summary:
         spec_section = f"\n[매각물건명세서 교차 검증 정보]\n{spec_summary}\n"
 
+    # 사용자 특별 요청사항 반영
+    user_req_section = ""
+    if hasattr(st, 'session_state') and st.session_state.get('user_requests'):
+        user_req_text = "\n".join([f"  {i+1}. {r}" for i, r in enumerate(st.session_state.user_requests)])
+        user_req_section = f"\n[사용자 특별 요청사항 — 반드시 분석에 반영할 것]\n{user_req_text}\n"
+
     # 각 건을 번호로 태그하여 하나의 텍스트로 합침
     items_text = ""
     for item in ai_rows_data:
@@ -574,6 +580,7 @@ def ask_gemini_for_rights_batch(ai_rows_data, base_date, model, spec_summary=Non
     [사건 기준 정보]
     - 확정된 말소기준권리 일자: {base_date}
     {spec_section}
+    {user_req_section}
     [분석할 등기 권리 목록 (총 {len(ai_rows_data)}건)]
     {items_text}
 
@@ -1154,6 +1161,12 @@ def ask_gemini_for_safety_report(df, base_date, model, spec_summary=None, parsed
         if confirmed_malso_summary:
             confirmed_ref = f"\n[✅ 확정된 말소 대상 등기 목록 (프로그램 검증 완료)]\n{confirmed_malso_summary}"
 
+        # 사용자 특별 요청사항 반영
+        user_req_ref = ""
+        if hasattr(st, 'session_state') and st.session_state.get('user_requests'):
+            user_req_text = "\n".join([f"  {i+1}. {r}" for i, r in enumerate(st.session_state.user_requests)])
+            user_req_ref = f"\n[사용자 특별 요청사항 — 반드시 평가에 반영할 것]\n{user_req_text}"
+
         # 데이터 부족 경고 문구
         data_warning_note = ""
         if data_warnings:
@@ -1178,6 +1191,7 @@ def ask_gemini_for_safety_report(df, base_date, model, spec_summary=None, parsed
 {danger_summary}
     {spec_ref}
     {confirmed_ref}
+    {user_req_ref}
     [지시사항]
     1. 위험도 등급을 반드시 첫 줄에 표시해: "🟢 안전", "🟡 주의", "🔴 위험" 중 하나.
        - 🟢 안전: 인수되는 위험 권리 없음, 매각 후 소멸 대상 정상 처리
@@ -1276,6 +1290,14 @@ if 'base_date_info' not in st.session_state:
     st.session_state.base_date_info = None  # 📅 말소기준권리 상세 정보
 if 'safety_report' not in st.session_state:
     st.session_state.safety_report = None  # 🧾 종합 안전도 리포트
+if 'user_requests' not in st.session_state:
+    st.session_state.user_requests = []  # 📝 사용자 요청사항 목록
+if 'user_request_count' not in st.session_state:
+    st.session_state.user_request_count = 0  # 📝 요청 횟수 카운터 (최대 2회)
+if 'qa_history' not in st.session_state:
+    st.session_state.qa_history = []  # 💬 Q&A 대화 기록
+if 'qa_count' not in st.session_state:
+    st.session_state.qa_count = 0  # 💬 질문 횟수 카운터 (최대 2회)
 
 
 
@@ -1938,6 +1960,39 @@ if st.session_state.step == 1:
                 st.error(f"분석 중 오류가 발생했습니다: {e}")
 
     st.markdown("<br>", unsafe_allow_html=True)
+
+    # =========================================================
+    # 📝 AI에게 요청할 사항 입력 영역 (최대 2회)
+    # =========================================================
+    st.markdown("---")
+    st.subheader("📝 AI에게 요청할 사항")
+    st.caption("권리분석 시 AI가 특별히 확인하거나 반영해야 할 사항을 입력해 주세요. (최대 2회)")
+
+    # 이미 등록된 요청사항 표시
+    if st.session_state.user_requests:
+        for i, req in enumerate(st.session_state.user_requests, 1):
+            st.info(f"📌 요청 {i}: {req}")
+
+    if st.session_state.user_request_count < 2:
+        user_req_input = st.text_area(
+            "요청사항을 입력하세요",
+            placeholder="예: 전세권이 있는 경우 보증금 반환 가능성을 자세히 분석해 주세요. / 이 물건은 토지만 경매입니다. / 임차인이 실제 거주 중입니다.",
+            key="user_request_input",
+            height=100,
+            label_visibility="collapsed"
+        )
+        remaining = 2 - st.session_state.user_request_count
+        if st.button(f"📝 요청사항 등록 (남은 횟수: {remaining}회)", use_container_width=True):
+            if user_req_input and user_req_input.strip():
+                st.session_state.user_requests.append(user_req_input.strip())
+                st.session_state.user_request_count += 1
+                st.rerun()
+            else:
+                st.warning("요청사항을 입력해 주세요.")
+    else:
+        st.success("✅ 요청사항 2회를 모두 등록하셨습니다. 등록된 내용은 AI 분석에 반영됩니다.")
+
+    st.markdown("---")
     
     st.info("💡 **최고의 인식률을 위한 꿀팁!**\n\n무료 스캐너 앱 **'vFlat'**으로 문서를 찍어서 올리시면, 사진 용량이 1/10로 줄어들어 분석 속도와 인식률이 비약적으로 상승합니다.")
     col1, col2 = st.columns(2)
@@ -2374,12 +2429,100 @@ elif st.session_state.step == 2:
         st.markdown("<br>", unsafe_allow_html=True)
 
     # =========================================================
+    # 💬 분석 결과 Q&A (최대 2회 질문)
+    # =========================================================
+    st.markdown("---")
+    st.subheader("💬 분석 결과에 대해 질문하기")
+    st.caption("분석 결과에 대해 궁금한 점을 AI에게 질문할 수 있습니다. (최대 2회)")
+
+    # 기존 Q&A 대화 이력 표시
+    if st.session_state.qa_history:
+        for qa in st.session_state.qa_history:
+            with st.chat_message("user"):
+                st.markdown(qa['question'])
+            with st.chat_message("assistant"):
+                st.markdown(qa['answer'])
+
+    if st.session_state.qa_count < 2:
+        qa_remaining = 2 - st.session_state.qa_count
+        qa_input = st.text_input(
+            "질문을 입력하세요",
+            placeholder="예: 인수되는 전세권의 보증금은 얼마인가요? / 이 물건에서 가장 주의해야 할 점은?",
+            key="qa_input",
+            label_visibility="collapsed"
+        )
+        if st.button(f"💬 질문하기 (남은 횟수: {qa_remaining}회)", use_container_width=True):
+            if qa_input and qa_input.strip():
+                with st.spinner("🤖 AI가 답변을 준비하고 있습니다..."):
+                    try:
+                        genai.configure(api_key=GEMINI_API_KEY)
+                        qa_model = genai.GenerativeModel('gemini-3-flash-preview')
+
+                        # 분석 결과 요약 구성
+                        qa_context_parts = []
+                        if st.session_state.final_df is not None:
+                            result_df = st.session_state.final_df
+                            for _, r in result_df.iterrows():
+                                qa_context_parts.append(
+                                    f"{r.get('구분','')} 순위 {r.get('순위번호','')}: {r.get('등기목적','')} → {r.get('결과','')} | {r.get('AI_상세이유','')}"
+                                )
+                        qa_context = "\n".join(qa_context_parts)
+
+                        safety_ctx = st.session_state.safety_report or ""
+                        spec_ctx = st.session_state.spec_summary or ""
+                        malso_report_ctx = st.session_state.malso_omission_report or ""
+
+                        qa_prompt = f"""
+너는 대한민국 법원 경매 권리분석 최고 전문가야.
+아래는 이미 완료된 권리분석 결과야. 사용자의 질문에 이 분석 결과를 바탕으로 정확하고 친절하게 답변해 줘.
+
+[분석 결과]
+{qa_context}
+
+[종합 안전도 리포트]
+{safety_ctx}
+
+[매각물건명세서 분석]
+{spec_ctx}
+
+[매각 후 소멸 권리 분석]
+{malso_report_ctx}
+
+[사용자 질문]
+{qa_input.strip()}
+
+[지시사항]
+- 분석 결과에 기반하여 정확하게 답변해 주세요.
+- 확실하지 않은 부분은 "원본 등기부등본을 확인해 주세요"라고 안내해 주세요.
+- 답변은 한국어로, 간결하면서도 핵심적인 내용을 포함해 주세요.
+"""
+                        qa_response = qa_model.generate_content(qa_prompt)
+                        answer = qa_response.text
+
+                        st.session_state.qa_history.append({
+                            'question': qa_input.strip(),
+                            'answer': answer
+                        })
+                        st.session_state.qa_count += 1
+                        st.rerun()
+
+                    except Exception as qa_err:
+                        st.error(f"⚠️ AI 답변 생성 중 오류가 발생했습니다: {qa_err}")
+            else:
+                st.warning("질문을 입력해 주세요.")
+    else:
+        st.success("✅ 질문 2회를 모두 사용하셨습니다.")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # =========================================================
     # 🔄 처음으로 돌아가기
     # =========================================================
     if st.button("🔄 처음으로 돌아가기", use_container_width=True):
         for key in ['final_df', 'malso_df', 'spec_summary', 'danger_warnings',
                      'malso_omission_report', 'base_date_info', 'safety_report',
-                     'cross_warnings']:
+                     'cross_warnings', 'user_requests', 'user_request_count',
+                     'qa_history', 'qa_count']:
             if key in st.session_state:
                 del st.session_state[key]
         st.session_state.step = 1
