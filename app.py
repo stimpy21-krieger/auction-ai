@@ -1039,10 +1039,7 @@ def ask_gemini_for_malso_omission(all_records_text, base_date, model, spec_summa
     {confirmed_malso_summary}
         """
 
-    # 프롬프트 크기 제한 (토큰 초과 방지)
-    max_text_len = 8000
-    if len(all_records_text) > max_text_len:
-        all_records_text = all_records_text[:max_text_len] + "\n... (이하 생략, 총 텍스트가 너무 길어 일부만 전달)"
+
 
     prompt = f"""
     너는 대한민국 법원 경매 권리분석 최고 전문가이자 '매각 후 소멸 대상 권리 분석 전문가'야.
@@ -1114,17 +1111,17 @@ def ask_gemini_for_safety_report(df, base_date, model, spec_summary=None, parsed
             data_warnings.append("서류확인 항목 필터링 실패")
 
         try:
-            insu_list = [f"  - {r['구분']} 순위번호 {r['순위번호']}: {r['등기목적']}" for _, r in insu_rows.head(10).iterrows()]
-            insu_summary = "\n".join(insu_list) if insu_list else "  없음"
-            if len(insu_rows) > 10:
-                insu_summary += f"\n  ... 외 {len(insu_rows) - 10}건"
+            insu_summary = "\n".join(
+                [f"  - {r['구분']} 순위번호 {r['순위번호']}: {r['등기목적']}" for _, r in insu_rows.iterrows()]
+            ) if not insu_rows.empty else "  없음"
         except Exception:
             insu_summary = "  데이터 추출 실패"
             data_warnings.append("인수 권리 요약 생성 실패")
 
         try:
-            danger_list = [f"  - {r['구분']} 순위번호 {r['순위번호']}: {r['등기목적']}" for _, r in danger_rows.head(10).iterrows()]
-            danger_summary = "\n".join(danger_list) if danger_list else "  없음"
+            danger_summary = "\n".join(
+                [f"  - {r['구분']} 순위번호 {r['순위번호']}: {r['등기목적']}" for _, r in danger_rows.iterrows()]
+            ) if not danger_rows.empty else "  없음"
         except Exception:
             danger_summary = "  데이터 추출 실패"
             data_warnings.append("위험 권리 요약 생성 실패")
@@ -1298,7 +1295,7 @@ if st.session_state.step == 1:
         else:
             try:
                 genai.configure(api_key=GEMINI_API_KEY)
-                model = genai.GenerativeModel('gemini-3-flash')
+                model = genai.GenerativeModel('gemini-3-flash-preview')
                 
                 # 📂 Natural Sort: 파일명 숫자 기준 정렬 (1 < 2 < 10)
                 def natural_sort_key(f):
