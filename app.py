@@ -1625,6 +1625,16 @@ if st.session_state.step == 1:
                                 rec['접수일자_표시'], rec['등기목적'] = "확인불가", "확인불가"
 
                             rec['말소후보'] = any(kw in content for kw in base_keywords)
+
+                            # 🛡️ 교차 검증: 등기목적(purpose) 자체에 말소기준권리 키워드가 없으면 말소후보 해제
+                            # (전체내용에 다른 등기의 키워드가 섞여 들어온 경우 방지)
+                            # 예: 소유권이전, 파산선고, 상속, 증여 등은 전체내용에 '압류' 등이 포함되더라도 말소후보가 아님
+                            if rec['말소후보']:
+                                purpose_clean = rec.get('등기목적', '').replace(' ', '')
+                                purpose_has_base_kw = any(kw in purpose_clean for kw in base_keywords)
+                                if not purpose_has_base_kw:
+                                    rec['말소후보'] = False
+
                             rec['절대인수'] = any(kw in content for kw in always_keep_keywords)
                             rec['AI해석필요'] = any(kw in content for kw in ai_check_keywords)
                             rec['소유권이전'] = '이전' in content and not rec['말소후보'] and not rec['절대인수']
