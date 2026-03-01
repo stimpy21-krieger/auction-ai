@@ -9,3 +9,4 @@ Pillow
 fpdf2
 plotly
 aiohttp
+pillow-heif

@@ -15,6 +15,7 @@ from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from io import BytesIO
 from PIL import Image
+import pillow_heif  # HEIC/HEIF 지원 (아이폰 사진)
 import plotly.graph_objects as go
 import typing
 import asyncio
@@ -124,37 +125,54 @@ st.markdown("""
 # =====================================================================
 def smart_preprocess(file_bytes):
     """스마트폰 사진을 OCR 최적화 전처리합니다.
+    - HEIC/HEIF → PNG 자동 변환 (아이폰 사진 지원)
+    - PIL RGB 강제 변환 → 메타데이터 충돌 100% 방지
     - 해상도 유지 (resize 없음)
     - Grayscale + CLAHE 대비 향상 → 용량 축소 + 선명도 향상
     - Hough Line Transform 기반 deskew → 기울어진 문서 자동 수평 보정
     - PNG 무손실 출력
     """
     try:
-        # EXIF 회전 보정 (스마트폰 방향)
+        # ===== [1] HEIC/HEIF 변환 (아이폰 사진 지원) =====
+        try:
+            heif_image = pillow_heif.read_heif(file_bytes)
+            pil_img = Image.frombytes(
+                heif_image.mode, heif_image.size, heif_image.data,
+                "raw", heif_image.mode, heif_image.stride
+            )
+            buf = BytesIO()
+            pil_img.save(buf, format='PNG')
+            file_bytes = buf.getvalue()
+        except Exception:
+            pass  # HEIC가 아니면 무시하고 진행
+
+        # ===== [2] PIL 기반 이미지 디코딩 안정화 =====
+        # PIL로 먼저 열어서 RGB 모드로 강제 변환 → EXIF 회전 보정 + 메타데이터 충돌 방지
         try:
             from PIL import ImageOps
             pil_img = Image.open(BytesIO(file_bytes))
-            pil_img = ImageOps.exif_transpose(pil_img)
+            pil_img = ImageOps.exif_transpose(pil_img)  # EXIF 회전 보정
+            pil_img = pil_img.convert('RGB')  # RGB 강제 변환 (RGBA, P, L 등 모든 모드 대응)
             buf = BytesIO()
             pil_img.save(buf, format='PNG')
             file_bytes = buf.getvalue()
         except Exception:
             pass
 
-        # 바이트 → OpenCV
+        # ===== [3] 바이트 → OpenCV =====
         nparr = np.frombuffer(file_bytes, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         if img is None:
             return file_bytes, 'png'
 
-        # 1) Grayscale
+        # 4) Grayscale
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-        # 2) CLAHE 대비 향상 (그림자/조명 보정)
+        # 5) CLAHE 대비 향상 (그림자/조명 보정)
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         enhanced = clahe.apply(gray)
 
-        # 3) Hough Line Transform 기반 deskew
+        # 6) Hough Line Transform 기반 deskew
         edges = cv2.Canny(enhanced, 50, 150, apertureSize=3)
         lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=100,
                                 minLineLength=img.shape[1] // 4, maxLineGap=10)
@@ -177,7 +195,7 @@ def smart_preprocess(file_bytes):
                         borderMode=cv2.BORDER_REPLICATE
                     )
 
-        # 4) 약한 선명화 (과도한 sharpening 방지)
+        # 7) 약한 선명화 (과도한 sharpening 방지)
         blurred = cv2.GaussianBlur(enhanced, (0, 0), 2)
         sharpened = cv2.addWeighted(enhanced, 1.3, blurred, -0.3, 0)
 
@@ -1250,7 +1268,7 @@ if st.session_state.step == 1:
     st.markdown("스마트폰으로 등기부등본과 매각물건명세서 사진을 찍어서 올리면, AI가 자동으로 권리를 분석해 줍니다.")
     
     # CSS로 영어 문구가 완벽히 숨겨진 업로드 창
-    uploaded_files = st.file_uploader(" ", accept_multiple_files=True, type=['jpg', 'jpeg', 'png'], label_visibility="collapsed")
+    uploaded_files = st.file_uploader(" ", accept_multiple_files=True, type=['jpg', 'jpeg', 'png', 'heic', 'heif'], label_visibility="collapsed")
 
     if st.button("🚀 권리분석 시작", type="primary", use_container_width=True):
         if not uploaded_files:
