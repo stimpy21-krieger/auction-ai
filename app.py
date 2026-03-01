@@ -85,7 +85,7 @@ st.markdown("""
         'Browse file': '사진 선택하기'
     };
     const LIMIT_REGEX = /Limit\s+\d+(\.?\d*)\s*(MB|KB|GB)\s+per\s+file/gi;
-    const LIMIT_KO = '파일당 최대 200MB';
+    const LIMIT_KO = '파일당 최대 500MB';
 
     // 업로드 중 DOM 변경 방지 플래그
     let isUploading = false;
@@ -2015,12 +2015,7 @@ if st.session_state.step == 1:
 
     st.markdown("<br>", unsafe_allow_html=True)
     
-    st.info("💡 **최고의 인식률을 위한 꿀팁!**\n\n무료 스캐너 앱 **'vFlat'**으로 문서를 찍어서 올리시면, 사진 용량이 1/10로 줄어들어 분석 속도와 인식률이 비약적으로 상승합니다.")
-    col1, col2 = st.columns(2)
-    with col1:
-        st.link_button("🍎 아이폰 vFlat 설치", "https://apps.apple.com/kr/app/vflat-scan-pdf-scanner/id1540238220", use_container_width=True)
-    with col2:
-        st.link_button("🤖 갤럭시 vFlat 설치", "https://play.google.com/store/apps/details?id=com.voyagerx.scanner", use_container_width=True)
+    st.info("💡 **최고의 인식률을 위한 꿀팁!**\n\n무료 스캐너 앱 **'vFlat'**으로 문서를 찍어서 올리시면, 사진 용량이 1/10로 줄어들어 분석 속도와 인식률이 비약적으로 상승합니다.\n\n🍎 [아이폰 vFlat 설치](https://apps.apple.com/kr/app/vflat-scan-pdf-scanner/id1540238220) &nbsp;&nbsp;|&nbsp;&nbsp; 🤖 [갤럭시 vFlat 설치](https://play.google.com/store/apps/details?id=com.voyagerx.scanner)")
     st.markdown("<br>", unsafe_allow_html=True)
 
     # 🌟 수정된 주의사항 (요청하신 대로 군더더기 없이 깔끔하게!)
