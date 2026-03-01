@@ -1,7 +1,7 @@
 streamlit
 requests
 pandas
-google-generativeai>=1.56.0
+google-generativeai
 python-docx
 opencv-python-headless
 numpy
