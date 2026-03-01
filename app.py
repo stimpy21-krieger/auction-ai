@@ -16,6 +16,10 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from io import BytesIO
 from PIL import Image
 import plotly.graph_objects as go
+import typing
+import asyncio
+import aiohttp
+from functools import lru_cache
 
 # =====================================================================
 # 🎨 1. 스트림릿 기본 설정 & 2030 타겟 감성 디자인 (CSS)
@@ -212,6 +216,7 @@ AUCTION_TERM_CORRECTIONS = {
     '경매개시겸정': '경매개시결정',
 }
 
+@lru_cache(maxsize=None)
 def _levenshtein_distance(s1, s2):
     """두 문자열 사이의 Levenshtein 편집 거리를 계산합니다."""
     if len(s1) < len(s2):
@@ -516,10 +521,17 @@ def ask_gemini_for_rights(record_text, base_date, model, spec_summary=None, sect
     """
     return model.generate_content(prompt).text
 
+# 📐 Gemini Structured Output 스키마 정의 (환각 원천 차단)
+class RightResult(typing.TypedDict):
+    index: int
+    result: str
+    reason: str
+
 def ask_gemini_for_rights_batch(ai_rows_data, base_date, model, spec_summary=None):
     """여러 건의 AI 정밀해석 대상을 단 1회의 API 호출로 일괄 처리합니다.
     ai_rows_data: list of dict — [{"index": int, "content": str, "section_gu": str}, ...]
     반환: dict — {index: {"결과": str, "이유": str}, ...}
+    Gemini Structured Outputs를 사용하여 JSON 스키마를 강제 적용합니다.
     """
     if not ai_rows_data:
         return {}
@@ -549,28 +561,20 @@ def ask_gemini_for_rights_batch(ai_rows_data, base_date, model, spec_summary=Non
 
     [지시사항]
     1. 각 항목(#번호)에 대해 인수/말소/추가확인을 판단해.
-    2. 반드시 아래 JSON 배열 형식으로만 응답해. 인사말이나 설명 없이 순수 JSON만 출력해.
-    3. 형식:
-    [
-      {{"index": 항목번호, "result": "인수" 또는 "말소" 또는 "추가확인", "reason": "간략한 1~2줄 이유"}},
-      ...
-    ]
+    2. index에는 항목번호, result에는 "인수" 또는 "말소" 또는 "추가확인", reason에는 간략한 1~2줄 이유를 적어.
     """
 
     try:
-        raw_response = model.generate_content(prompt).text
+        # Gemini Structured Outputs: response_schema로 JSON 형식 강제
+        response = model.generate_content(
+            prompt,
+            generation_config=genai.GenerationConfig(
+                response_mime_type="application/json",
+                response_schema=list[RightResult]
+            )
+        )
 
-        # Markdown 코드블록 제거 (```json ... ``` 또는 ``` ... ```)
-        cleaned = re.sub(r'^```(?:json)?\s*', '', raw_response.strip(), flags=re.MULTILINE)
-        cleaned = re.sub(r'```\s*$', '', cleaned.strip(), flags=re.MULTILINE)
-        cleaned = cleaned.strip()
-
-        # JSON 배열 추출 시도 (응답 중간에 설명이 섞여있을 수 있음)
-        json_match = re.search(r'\[\s*\{.*\}\s*\]', cleaned, re.DOTALL)
-        if json_match:
-            cleaned = json_match.group(0)
-
-        results_list = json.loads(cleaned)
+        results_list = json.loads(response.text)
 
         results = {}
         for item in results_list:
@@ -1243,7 +1247,7 @@ if 'safety_report' not in st.session_state:
 # =====================================================================
 if st.session_state.step == 1:
     st.title("🧙‍♂️ AI 경매 권리분석 마법사")
-    st.markdown("스마트폰으로 등기부등본 사진을 찍어서 올리면, AI가 자동으로 권리를 분석해 줍니다.")
+    st.markdown("스마트폰으로 등기부등본과 매각물건명세서 사진을 찍어서 올리면, AI가 자동으로 권리를 분석해 줍니다.")
     
     # CSS로 영어 문구가 완벽히 숨겨진 업로드 창
     uploaded_files = st.file_uploader(" ", accept_multiple_files=True, type=['jpg', 'jpeg', 'png'], label_visibility="collapsed")
@@ -1254,7 +1258,7 @@ if st.session_state.step == 1:
         else:
             try:
                 genai.configure(api_key=GEMINI_API_KEY)
-                model = genai.GenerativeModel('gemini-2.5-flash')
+                model = genai.GenerativeModel('gemini-3-flash')
                 
                 # 📂 Natural Sort: 파일명 숫자 기준 정렬 (1 < 2 < 10)
                 def natural_sort_key(f):
@@ -1269,62 +1273,100 @@ if st.session_state.step == 1:
                 progress_bar = st.progress(0, text='📸 분석 준비 중...')
 
 
+                # =====================================================
+                # 🚀 비동기 OCR 처리 (aiohttp + asyncio.Semaphore)
+                # =====================================================
+                # 1단계: 캐시 히트 파일 사전 분리 + 전처리
+                ocr_tasks = []  # [(file_idx, file_name, file_hash, preprocessed_bytes, file_format)]
                 for file_idx, file in enumerate(sorted_files):
                     raw_bytes = file.getvalue()
-
-
-                    # 💰 OCR 캐싱: 파일 해시로 중복 체크 (부분 재분석 지원)
                     file_hash = hashlib.sha256(raw_bytes).hexdigest()
+
                     if file_hash in st.session_state.ocr_cache:
                         progress_bar.progress((file_idx + 1) / total_files, text=f'💰 캐시 사용 ({file_idx + 1}/{total_files}): {file.name}')
                         all_clean_rows.extend(st.session_state.ocr_cache[file_hash])
                         cache_hit_count += 1
-                        continue
+                    else:
+                        # 전처리는 동기로 수행 (CPU 작업)
+                        preprocessed_bytes, file_format = smart_preprocess(raw_bytes)
+                        ocr_tasks.append((file_idx, file.name, file_hash, preprocessed_bytes, file_format))
 
-                    progress_bar.progress((file_idx) / total_files, text=f'📸 분석 중 ({file_idx + 1}/{total_files}): {file.name}')
+                # 2단계: 비동기 OCR API 호출
+                if ocr_tasks:
+                    async def _ocr_single_file(session, sem, file_name, preprocessed_bytes, file_format, api_url, secret_key):
+                        """단일 파일 비동기 OCR 호출 (Semaphore 제어)"""
+                        async with sem:
+                            request_json = {
+                                'images': [{'format': file_format, 'name': 'demo'}],
+                                'requestId': str(uuid.uuid4()),
+                                'version': 'V2',
+                                'timestamp': int(round(time.time() * 1000))
+                            }
+                            headers = {'X-OCR-SECRET': secret_key}
+                            file_mime = 'image/png'
 
-                    # 🖼️ 스마트 전처리: Grayscale + CLAHE + Deskew → PNG
-                    preprocessed_bytes, file_format = smart_preprocess(raw_bytes)
-                    file_mime = 'image/png'
+                            for attempt in range(3):
+                                form_data = aiohttp.FormData()
+                                form_data.add_field('message', json.dumps(request_json).encode('UTF-8'))
+                                form_data.add_field('file', preprocessed_bytes,
+                                                    filename=file_name,
+                                                    content_type=file_mime)
+                                try:
+                                    async with session.post(api_url, headers=headers, data=form_data, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                                        if resp.status == 200:
+                                            return {'status': 'ok', 'data': await resp.json(), 'file_name': file_name}
+                                        elif resp.status == 429 and attempt < 2:
+                                            await asyncio.sleep(2 ** attempt)
+                                            continue
+                                        else:
+                                            return {'status': 'error', 'code': resp.status, 'file_name': file_name}
+                                except asyncio.TimeoutError:
+                                    if attempt < 2:
+                                        await asyncio.sleep(2)
+                                        continue
+                                    else:
+                                        return {'status': 'timeout', 'file_name': file_name}
+                                except Exception as e:
+                                    return {'status': 'exception', 'error': str(e), 'file_name': file_name}
+                            return {'status': 'error', 'code': 'max_retries', 'file_name': file_name}
 
-                    request_json = {'images': [{'format': file_format, 'name': 'demo'}], 'requestId': str(uuid.uuid4()), 'version': 'V2', 'timestamp': int(round(time.time() * 1000))}
-                    payload = {'message': json.dumps(request_json).encode('UTF-8')}
-                    headers = {'X-OCR-SECRET': NAVER_SECRET_KEY}
+                    async def _run_all_ocr(tasks, api_url, secret_key):
+                        """모든 OCR 작업을 비동기로 실행 (최대 3개 동시)"""
+                        sem = asyncio.Semaphore(3)
+                        async with aiohttp.ClientSession() as session:
+                            coroutines = [
+                                _ocr_single_file(session, sem, t[1], t[3], t[4], api_url, secret_key)
+                                for t in tasks
+                            ]
+                            return await asyncio.gather(*coroutines)
 
-                    # 🔄 네이버 OCR API 호출 (timeout 30초 + 재시도 2회)
-                    response = None
-                    for attempt in range(3):
-                        file_data = [('file', (file.name, preprocessed_bytes, file_mime))]
-                        try:
-                            response = requests.post(
-                                NAVER_API_URL, headers=headers, data=payload,
-                                files=file_data, timeout=30
-                            )
-                            if response.status_code == 200:
-                                break
-                            elif response.status_code == 429 and attempt < 2:
-                                time.sleep(2 ** attempt)
-                                continue
-                        except requests.exceptions.Timeout:
-                            if attempt < 2:
-                                time.sleep(2)
-                                continue
-                            else:
-                                st.error(f"⏱️ OCR 응답 시간 초과: {file.name}")
-                                st.stop()
-                        except requests.exceptions.RequestException as e:
-                            st.error(f"🌐 네트워크 오류: {e}")
+                    progress_bar.progress(cache_hit_count / total_files if total_files > 0 else 0, text='🚀 비동기 OCR 스캔 중...')
+                    ocr_results = asyncio.run(_run_all_ocr(ocr_tasks, NAVER_API_URL, NAVER_SECRET_KEY))
+
+                    # 3단계: 결과 처리 (텍스트 파싱 + 캐싱)
+                    for task_idx, (file_idx, file_name, file_hash, _, _) in enumerate(ocr_tasks):
+                        result = ocr_results[task_idx]
+                        progress_bar.progress((file_idx + 1) / total_files, text=f'📸 처리 중 ({file_idx + 1}/{total_files}): {file_name}')
+
+                        if result['status'] == 'timeout':
+                            st.error(f"⏱️ OCR 응답 시간 초과: {file_name}")
+                            st.stop()
+                        elif result['status'] == 'exception':
+                            st.error(f"🌐 네트워크 오류: {result.get('error', '')}")
+                            st.stop()
+                        elif result['status'] == 'error':
+                            st.error(f"OCR 스캔 실패 ({file_name}): HTTP {result.get('code', 'Unknown')}")
                             st.stop()
 
-                    if response and response.status_code == 200:
-                        images_data = response.json().get('images', [])
+                        # 성공 처리
+                        images_data = result['data'].get('images', [])
                         fields = images_data[0].get('fields', []) if images_data else []
                         if not fields:
-                            st.warning(f"⚠️ {file.name}에서 텍스트가 감지되지 않았습니다.")
+                            st.warning(f"⚠️ {file_name}에서 텍스트가 감지되지 않았습니다.")
                             continue
 
                         current_row, last_y, page_rows = [], -1, []
-                        low_conf_words = []  # 저신뢰도 단어 수집
+                        low_conf_words = []
                         sorted_fields = sorted(fields, key=lambda x: x['boundingPoly']['vertices'][0]['y'])
 
                         for field in sorted_fields:
@@ -1357,14 +1399,10 @@ if st.session_state.step == 1:
                         page_rows = [fuzzy_clean_text(row) for row in page_rows]
 
                         if low_conf_words:
-                            st.toast(f"📝 {file.name}: {len(low_conf_words)}개 저신뢰도 단어 자동 보정")
+                            st.toast(f"📝 {file_name}: {len(low_conf_words)}개 저신뢰도 단어 자동 보정")
 
                         st.session_state.ocr_cache[file_hash] = page_rows
                         all_clean_rows.extend(page_rows)
-                    else:
-                        status = response.status_code if response else 'No response'
-                        st.error(f"OCR 스캔 실패 ({file.name}): HTTP {status}")
-                        st.stop()
 
                 progress_bar.progress(1.0, text='✅ 분석 완료!')
 
@@ -1829,6 +1867,14 @@ if st.session_state.step == 1:
 
     st.markdown("<br>", unsafe_allow_html=True)
     
+    st.info("💡 **최고의 인식률을 위한 꿀팁!**\n\n무료 스캐너 앱 **'vFlat'**으로 문서를 찍어서 올리시면, 사진 용량이 1/10로 줄어들어 분석 속도와 인식률이 비약적으로 상승합니다.")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.link_button("🍎 아이폰 vFlat 설치", "https://apps.apple.com/kr/app/vflat-scan-pdf-scanner/id1540238220", use_container_width=True)
+    with col2:
+        st.link_button("🤖 갤럭시 vFlat 설치", "https://play.google.com/store/apps/details?id=com.voyagerx.scanner", use_container_width=True)
+    st.markdown("<br>", unsafe_allow_html=True)
+
     # 🌟 수정된 주의사항 (요청하신 대로 군더더기 없이 깔끔하게!)
     with st.expander("🚨 주의사항 및 개인정보 보호 안내 (클릭해서 확인)"):
         st.markdown("""
@@ -1842,7 +1888,9 @@ if st.session_state.step == 1:
 elif st.session_state.step == 2:
     st.title("✨ 분석이 완료되었습니다!")
 
-    # 📊 분석 요약 대시보드
+    # =========================================================
+    # ① 📊 분석 요약 대시보드 (기존 동일)
+    # =========================================================
     if st.session_state.final_df is not None:
         result_df = st.session_state.final_df
         total = len(result_df)
@@ -1867,18 +1915,21 @@ elif st.session_state.step == 2:
 
         st.markdown("<br>", unsafe_allow_html=True)
 
-    # 📅 말소기준권리 일자 시각적 강조
+    # =========================================================
+    # ② 📅 말소기준권리 일자 시각적 강조
+    # =========================================================
     if st.session_state.base_date_info:
         bdi = st.session_state.base_date_info
         st.info(f"📅 **말소기준권리**: {bdi['date']}  |  {bdi['gu']} 순위번호 {bdi['rank']}번  |  {bdi['purpose']}\n\n이 날짜 이후(같은 날 포함)에 접수된 말소 대상 등기는 낙찰로 소멸됩니다.")
         st.markdown("<br>", unsafe_allow_html=True)
 
-    # 🧾 Feature A: 종합 안전도 리포트
+    # =========================================================
+    # ③ 🧾 종합 안전도 리포트 (기존 동일)
+    # =========================================================
     if st.session_state.safety_report:
         with st.expander("🧾 종합 안전도 리포트 (Gemini 평가)", expanded=True):
             try:
                 report = st.session_state.safety_report
-                # 위험도 등급에 따른 색상 표시
                 if '🟢' in report:
                     st.success(report)
                 elif '🔴' in report:
@@ -1889,13 +1940,68 @@ elif st.session_state.step == 2:
                 st.warning(f"⚠️ 종합 안전도 리포트 표시 중 오류: {report_err}")
         st.markdown("<br>", unsafe_allow_html=True)
 
-    # 📊 Feature B: 권리 타임라인 시각화 (개선됨)
+    # =========================================================
+    # ④ 🚨 매각물건명세서 위험 경고
+    # =========================================================
+    if st.session_state.danger_warnings:
+        st.subheader("🚨 매각물건명세서 위험 경고")
+        for warning in st.session_state.danger_warnings:
+            st.error(warning)
+        st.markdown("<br>", unsafe_allow_html=True)
+
+    # =========================================================
+    # ⑤ 📋 매각물건명세서 교차 검증 결과
+    # =========================================================
+    if st.session_state.spec_summary:
+        with st.expander("📋 매각물건명세서 분석 결과 (교차 검증 완료)", expanded=True):
+            st.info("📋 매각물건명세서가 감지되어 등기부등본과 교차 검증을 수행했습니다. AI 판단의 정확도가 향상되었습니다.")
+            st.markdown(st.session_state.spec_summary)
+        st.markdown("<br>", unsafe_allow_html=True)
+
+    # =========================================================
+    # ⑥ 🤖 AI 상세 판독 내역 및 수정 (st.data_editor)
+    #    → 다운로드보다 위에 배치하여 수정 후 반영되도록
+    # =========================================================
+    with st.expander("🤖 AI 상세 판독 내역 및 수정 (클릭하여 결과 직접 교정)", expanded=True):
+        display_cols = ['구분', '순위번호', '등기목적', '결과', 'AI_상세이유']
+        edited_df = st.data_editor(
+            st.session_state.final_df[display_cols],
+            use_container_width=True,
+            disabled=['구분', '순위번호', '등기목적'],
+            key='rights_editor'
+        )
+        # 수정 내역을 final_df에 즉시 반영
+        st.session_state.final_df['결과'] = edited_df['결과'].values
+        st.session_state.final_df['AI_상세이유'] = edited_df['AI_상세이유'].values
+
+        # � malso_df도 수정된 final_df 기반으로 재필터링 (데이터 동기화)
+        _updated_malso = st.session_state.final_df[
+            st.session_state.final_df['결과'].str.contains('말소', na=False) &
+            ~st.session_state.final_df['결과'].str.contains('이미 말소됨', na=False)
+        ][['구분', '순위번호', '등기목적', '접수일자_표시']]
+        _updated_malso.columns = ['구분', '순위번호', '등기목적', '접수일자']
+        _updated_malso.index = range(1, len(_updated_malso) + 1)
+        st.session_state.malso_df = _updated_malso
+
+        # 📝 접수번호 OCR 오타 경고 표시
+        if '접수번호_오타' in st.session_state.final_df.columns:
+            typo_rows = st.session_state.final_df[st.session_state.final_df['접수번호_오타'] != ''].copy()
+            if not typo_rows.empty:
+                st.markdown("---")
+                st.markdown("**📝 접수번호 OCR 오타 감지 결과**")
+                for _, row in typo_rows.iterrows():
+                    st.warning(f"순위번호 {row['순위번호']}번: {row['접수번호_오타']}")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # =========================================================
+    # ⑦ 📊 권리 타임라인 시각화 (에디터 수정 후 색상 연동)
+    # =========================================================
     if st.session_state.final_df is not None:
         timeline_df = st.session_state.final_df.dropna(subset=['접수일자_기준']).copy()
         if not timeline_df.empty:
             with st.expander("📊 권리 타임라인 시각화", expanded=True):
               try:
-                # 결과별 색상 매핑
                 result_color_map = {
                     '인수': '#2ecc71',
                     '말소': '#e74c3c',
@@ -1907,20 +2013,19 @@ elif st.session_state.step == 2:
                     '기타': '#7f8c8d',
                 }
 
-                # 권리 종류별 색상 매핑 (등기목적 기반)
                 purpose_color_map = {
-                    '근저당': '#E74C3C',      # 빨강
-                    '저당': '#E74C3C',         # 빨강
-                    '압류': '#C0392B',          # 진빨강
-                    '가압류': '#E67E22',        # 주황
-                    '경매개시결정': '#D35400',   # 진주황
-                    '전세권': '#2980B9',        # 파랑
-                    '임차권': '#3498DB',        # 하늘색
-                    '지상권': '#27AE60',        # 초록
-                    '가처분': '#8E44AD',        # 보라
-                    '가등기': '#9B59B6',        # 연보라
-                    '소유권이전': '#1ABC9C',     # 청록
-                    '유치권': '#F39C12',        # 노랑
+                    '근저당': '#E74C3C',
+                    '저당': '#E74C3C',
+                    '압류': '#C0392B',
+                    '가압류': '#E67E22',
+                    '경매개시결정': '#D35400',
+                    '전세권': '#2980B9',
+                    '임차권': '#3498DB',
+                    '지상권': '#27AE60',
+                    '가처분': '#8E44AD',
+                    '가등기': '#9B59B6',
+                    '소유권이전': '#1ABC9C',
+                    '유치권': '#F39C12',
                 }
 
                 def get_purpose_color(purpose, result):
@@ -1929,7 +2034,6 @@ elif st.session_state.step == 2:
                     for key, color in purpose_color_map.items():
                         if key in purpose_clean:
                             return color
-                    # fallback: 결과 기반 색상
                     for key, color in result_color_map.items():
                         if key in str(result):
                             return color
@@ -1938,16 +2042,12 @@ elif st.session_state.step == 2:
                 timeline_df['색상'] = timeline_df.apply(
                     lambda r: get_purpose_color(r.get('등기목적', ''), r.get('결과', '')), axis=1
                 )
-                # 구분을 숫자로 (갑구=1, 을구=2)
                 timeline_df['Y축'] = timeline_df['구분'].apply(lambda x: 1 if '갑' in x else 2)
-                # datetime.date → 문자열 변환 (Plotly 호환)
                 timeline_df['날짜_str'] = timeline_df['접수일자_기준'].apply(lambda d: d.isoformat() if d else None)
 
                 fig = go.Figure()
 
-                # 등기 포인트 (개선: textposition='outside', 상세 호버)
                 for _, row in timeline_df.iterrows():
-                    # 호버 상세 정보 구성 (접수번호, 금액 포함)
                     hover_lines = [
                         f"<b>{row['구분']} #{row['순위번호']}</b>",
                         f"📋 {row['등기목적']}",
@@ -1955,7 +2055,6 @@ elif st.session_state.step == 2:
                     ]
                     if row.get('접수번호'):
                         hover_lines.append(f"🔢 접수번호: 제{row['접수번호']}호")
-                    # 채권최고액 추출 시도
                     content = str(row.get('전체내용', ''))
                     amt_match = re.search(r'(?:채권최고액|금)\s*([\d,]+)\s*원', content.replace(' ', ''))
                     if amt_match:
@@ -1981,7 +2080,6 @@ elif st.session_state.step == 2:
                         showlegend=False,
                     ))
 
-                # 말소기준권리 수직선 (add_shape + add_annotation으로 대체 — add_vline은 date 객체 버그 있음)
                 if st.session_state.base_date_info:
                     bd = st.session_state.base_date_info['date']
                     bd_str = bd.isoformat() if hasattr(bd, 'isoformat') else str(bd)
@@ -1998,7 +2096,6 @@ elif st.session_state.step == 2:
                         yshift=12,
                     )
 
-                # 범례 (더미 트레이스 — 권리 종류별)
                 legend_items = [
                     ('근저당/저당', '#E74C3C'), ('압류', '#C0392B'),
                     ('가압류', '#E67E22'), ('경매개시결정', '#D35400'),
@@ -2034,24 +2131,13 @@ elif st.session_state.step == 2:
                 st.warning(f"⚠️ 타임라인 차트 표시 중 오류: {chart_err}")
             st.markdown("<br>", unsafe_allow_html=True)
 
-    # 🚨 매각물건명세서 위험 경고 (최상단에 표시)
-    if st.session_state.danger_warnings:
-        st.subheader("🚨 매각물건명세서 위험 경고")
-        for warning in st.session_state.danger_warnings:
-            st.error(warning)
-        st.markdown("<br>", unsafe_allow_html=True)
-
-    # 📋 매각물건명세서 교차 검증 결과
-    if st.session_state.spec_summary:
-        with st.expander("📋 매각물건명세서 분석 결과 (교차 검증 완료)", expanded=True):
-            st.info("📋 매각물건명세서가 감지되어 등기부등본과 교차 검증을 수행했습니다. AI 판단의 정확도가 향상되었습니다.")
-            st.markdown(st.session_state.spec_summary)
-        st.markdown("<br>", unsafe_allow_html=True)
-
+    # =========================================================
+    # ⑧ 📑 말소할 등기 목록 + � 다운로드 (수정된 malso_df 사용)
+    # =========================================================
     st.subheader("📑 법원 제출용: 말소할 등기 목록")
     st.table(st.session_state.malso_df)
 
-    # 📥 DOCX 문서 생성
+    # 📥 DOCX 문서 생성 (최종 업데이트된 malso_df 기반)
     doc = Document()
     doc.add_heading('말 소 할  등 기  목 록', level=1).alignment = WD_ALIGN_PARAGRAPH.CENTER
     doc.add_paragraph()
@@ -2069,16 +2155,9 @@ elif st.session_state.step == 2:
     # 📥 PDF 문서 생성
     @st.cache_resource
     def _get_pdf_font_path():
-        """PDF용 한글 폰트를 크로스플랫폼 temp 디렉토리에 캐시합니다."""
-        import tempfile
-        import urllib.request
-        font_path = os.path.join(tempfile.gettempdir(), 'NanumGothic-Regular.ttf')
-        if not os.path.exists(font_path):
-            urllib.request.urlretrieve(
-                'https://github.com/google/fonts/raw/main/ofl/nanumgothic/NanumGothic-Regular.ttf',
-                font_path
-            )
-        return font_path
+        """PDF용 한글 폰트를 app.py와 같은 폴더의 로컬 파일에서 직접 참조합니다."""
+        import os
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'NanumGothic-Regular.ttf')
 
     def generate_pdf(malso_df):
         try:
@@ -2127,7 +2206,9 @@ elif st.session_state.step == 2:
 
     st.markdown("<br><hr><br>", unsafe_allow_html=True)
 
-    # 🔬 고급 교차 검증 경고 표시
+    # =========================================================
+    # ⑨ 🔬 고급 교차 검증 경고 (맨 마지막 배치)
+    # =========================================================
     cross_warnings = st.session_state.get('cross_warnings', [])
     if cross_warnings:
         with st.expander(f"🔬 고급 교차 검증 경고 ({len(cross_warnings)}건)", expanded=True):
@@ -2141,7 +2222,9 @@ elif st.session_state.step == 2:
                 else:
                     st.warning(w)
 
-    # 🔍 매각 후 소멸(말소) 대상 권리 분석 보고서
+    # =========================================================
+    # ⑩ 🔍 매각 후 소멸(말소) 대상 권리 분석 보고서
+    # =========================================================
     if st.session_state.malso_omission_report:
         with st.expander("🔍 매각 후 소멸(말소) 대상 권리 분석 결과", expanded=True):
             report = st.session_state.malso_omission_report
@@ -2155,25 +2238,10 @@ elif st.session_state.step == 2:
                 st.markdown(report)
         st.markdown("<br>", unsafe_allow_html=True)
 
-    with st.expander("🤖 AI 상세 판독 내역 및 이유 보기 (클릭)"):
-        display_cols = ['구분', '순위번호', '등기목적', '결과', 'AI_상세이유']
-        st.dataframe(st.session_state.final_df[display_cols], use_container_width=True)
-
-        # 📝 접수번호 OCR 오타 경고 표시
-        if '접수번호_오타' in st.session_state.final_df.columns:
-            typo_rows = st.session_state.final_df[st.session_state.final_df['접수번호_오타'] != ''].copy()
-            if not typo_rows.empty:
-                st.markdown("---")
-                st.markdown("**📝 접수번호 OCR 오타 감지 결과**")
-                for _, row in typo_rows.iterrows():
-                    st.warning(f"순위번호 {row['순위번호']}번: {row['접수번호_오타']}")
-
-    st.markdown("<br>", unsafe_allow_html=True)
-
-
-
+    # =========================================================
+    # 🔄 처음으로 돌아가기
+    # =========================================================
     if st.button("🔄 처음으로 돌아가기", use_container_width=True):
-        # 🔄 전체 세션 상태 초기화 (이전 결과 혼합 방지)
         for key in ['final_df', 'malso_df', 'spec_summary', 'danger_warnings',
                      'malso_omission_report', 'base_date_info', 'safety_report',
                      'cross_warnings']:
