@@ -1020,7 +1020,7 @@ def evaluate_eviction_difficulty(df, base_date, parsed_records):
         pass
     return warnings
 
-def ask_gemini_for_malso_omission(all_records_text, base_date, model, spec_summary=None):
+def ask_gemini_for_malso_omission(all_records_text, base_date, model, spec_summary=None, confirmed_malso_summary=None):
     """Gemini에게 '매각 후 소멸(말소) 대상 권리 분석' 미션을 부여하여,
     매각 시 소멸되어야 할 권리와 인수 주의 권리를 분류합니다."""
     spec_ref = ""
@@ -1030,6 +1030,20 @@ def ask_gemini_for_malso_omission(all_records_text, base_date, model, spec_summa
     {spec_summary}
         """
 
+    # 확정된 말소 목록이 있으면 참조 데이터로 제공
+    confirmed_ref = ""
+    if confirmed_malso_summary:
+        confirmed_ref = f"""
+    [✅ 파이썬 엔진이 이미 확정한 말소 대상 등기 목록 (검증 완료)]
+    아래는 프로그램이 하드코딩된 법률 규칙으로 이미 확정한 말소 대상입니다. 이 목록을 기준으로 삼아서 분석해 줘.
+    {confirmed_malso_summary}
+        """
+
+    # 프롬프트 크기 제한 (토큰 초과 방지)
+    max_text_len = 8000
+    if len(all_records_text) > max_text_len:
+        all_records_text = all_records_text[:max_text_len] + "\n... (이하 생략, 총 텍스트가 너무 길어 일부만 전달)"
+
     prompt = f"""
     너는 대한민국 법원 경매 권리분석 최고 전문가이자 '매각 후 소멸 대상 권리 분석 전문가'야.
     아래 등기부등본 전체 내용과 말소기준권리 일자를 바탕으로, **특수 미션**을 수행해 줘.
@@ -1037,13 +1051,15 @@ def ask_gemini_for_malso_omission(all_records_text, base_date, model, spec_summa
     [🎯 특수 미션: 매각 후 소멸(말소) 대상 권리 분석]
     경매 매각 시 말소촉탁으로 **소멸되어야 할 권리**를 분석하고, 현재 등기부에 여전히 살아있는 것처럼 보이는 권리가 있다면 알려줘.
 
-    [권리분석 규칙]
-    {knowledge_base}
+    [권리분석 핵심 규칙]
+    - 말소기준권리 후보: 근저당권, 저당권, 압류, 가압류, 담보가등기, 경매개시결정등기
+    - 무조건 말소: 근저당권, 저당권, 압류, 가압류, 담보가등기 → 날짜 불문 소멸
+    - 무조건 인수 (날짜 불문): 유치권, 법정지상권, 분묘기지권, 예고등기, 건물철거/토지인도 가처분, 채무자회생법 등기
+    - 말소기준권리 이후 접수된 후순위 권리: 매각으로 소멸
 
     [사건 기준 정보]
     - 확정된 말소기준권리 일자: {base_date}
-    - 말소기준권리 일자 이후(같은 날 포함)에 접수된 근저당권, 가압류, 압류, 경매개시결정, 담보가등기 등은 매각으로 소멸(말소)되어야 합니다.
-
+    {confirmed_ref}
     [등기부등본 전체 내용]
     {all_records_text}
     {spec_ref}
@@ -1063,10 +1079,10 @@ def ask_gemini_for_malso_omission(all_records_text, base_date, model, spec_summa
     """
     try:
         return model.generate_content(prompt).text
-    except Exception:
-        return "매각 후 소멸 대상 권리 분석 실패 (API 오류)"
+    except Exception as e:
+        return f"매각 후 소멸 대상 권리 분석 실패 (API 오류: {str(e)[:150]})"
 
-def ask_gemini_for_safety_report(df, base_date, model, spec_summary=None, parsed_records=None):
+def ask_gemini_for_safety_report(df, base_date, model, spec_summary=None, parsed_records=None, confirmed_malso_summary=None):
     """전체 분석 결과를 바탕으로 Gemini에게 입찰 안전도 종합 의견을 요청합니다.
     데이터가 일부 누락되더라도 리포트가 실패하지 않도록 강화된 예외 처리를 적용합니다."""
     try:
@@ -1098,17 +1114,17 @@ def ask_gemini_for_safety_report(df, base_date, model, spec_summary=None, parsed
             data_warnings.append("서류확인 항목 필터링 실패")
 
         try:
-            insu_summary = "\n".join(
-                [f"  - {r['구분']} 순위번호 {r['순위번호']}: {r['등기목적']}" for _, r in insu_rows.iterrows()]
-            ) if not insu_rows.empty else "  없음"
+            insu_list = [f"  - {r['구분']} 순위번호 {r['순위번호']}: {r['등기목적']}" for _, r in insu_rows.head(10).iterrows()]
+            insu_summary = "\n".join(insu_list) if insu_list else "  없음"
+            if len(insu_rows) > 10:
+                insu_summary += f"\n  ... 외 {len(insu_rows) - 10}건"
         except Exception:
             insu_summary = "  데이터 추출 실패"
             data_warnings.append("인수 권리 요약 생성 실패")
 
         try:
-            danger_summary = "\n".join(
-                [f"  - {r['구분']} 순위번호 {r['순위번호']}: {r['등기목적']}" for _, r in danger_rows.iterrows()]
-            ) if not danger_rows.empty else "  없음"
+            danger_list = [f"  - {r['구분']} 순위번호 {r['순위번호']}: {r['등기목적']}" for _, r in danger_rows.head(10).iterrows()]
+            danger_summary = "\n".join(danger_list) if danger_list else "  없음"
         except Exception:
             danger_summary = "  데이터 추출 실패"
             data_warnings.append("위험 권리 요약 생성 실패")
@@ -1136,6 +1152,11 @@ def ask_gemini_for_safety_report(df, base_date, model, spec_summary=None, parsed
         if spec_summary:
             spec_ref = f"\n[매각물건명세서 분석 결과]\n{spec_summary}"
 
+        # 확정된 말소 목록 참조
+        confirmed_ref = ""
+        if confirmed_malso_summary:
+            confirmed_ref = f"\n[✅ 확정된 말소 대상 등기 목록 (프로그램 검증 완료)]\n{confirmed_malso_summary}"
+
         # 데이터 부족 경고 문구
         data_warning_note = ""
         if data_warnings:
@@ -1159,6 +1180,7 @@ def ask_gemini_for_safety_report(df, base_date, model, spec_summary=None, parsed
     [절대 인수 (위험 권리) 목록]
 {danger_summary}
     {spec_ref}
+    {confirmed_ref}
     [지시사항]
     1. 위험도 등급을 반드시 첫 줄에 표시해: "🟢 안전", "🟡 주의", "🔴 위험" 중 하나.
        - 🟢 안전: 인수되는 위험 권리 없음, 매각 후 소멸 대상 정상 처리
@@ -1176,8 +1198,8 @@ def ask_gemini_for_safety_report(df, base_date, model, spec_summary=None, parsed
             if data_warnings:
                 result = f"⚠️ [일부 데이터 부족으로 인한 추정치입니다]\n\n{result}"
             return result
-        except Exception:
-            return "종합 안전도 리포트 생성 실패 (API 오류)"
+        except Exception as inner_e:
+            return f"종합 안전도 리포트 생성 실패 (API 오류: {str(inner_e)[:150]})"
     except Exception as e:
         return f"⚠️ 종합 안전도 리포트 생성 중 오류가 발생했습니다: {e}\n\n확보된 데이터가 부족하여 리포트를 생성할 수 없습니다. 원본 등기부등본을 다시 확인해 주세요."
 
@@ -1620,13 +1642,16 @@ if st.session_state.step == 1:
                             has_malso_combined = any(mc in purpose_text for mc in malso_combined_purpose)
                             rec['이미말소됨'] = has_malso_in_purpose or has_malso_combined
 
-                            receipt_match = re.search(r'제\s*(\d+)\s*호', rec['전체내용'])
                             rec['접수번호_오타'] = ""
+                            receipt_match = re.search(r'제\s*(\d+)\s*호', rec['전체내용'])
                             if receipt_match:
-                                receipt_num = receipt_match.group(1)
-                                if len(receipt_num) <= 1 or len(receipt_num) >= 8:
-                                    rec['접수번호_오타'] = f"⚠️ 접수번호 '{receipt_num}'이(가) 패턴상 오타로 보입니다. 원본 확인 필요."
-                            elif rec.get('접수일자_표시', '') != '확인불가' and '제' not in rec['전체내용']:
+                                receipt_num_check = receipt_match.group(1)
+                                if len(receipt_num_check) <= 1 or len(receipt_num_check) >= 8:
+                                    rec['접수번호_오타'] = f"⚠️ 접수번호 '{receipt_num_check}'이(가) 패턴상 오타로 보입니다. 원본 확인 필요."
+                            elif rec.get('접수번호'):
+                                # fallback 패턴으로 접수번호가 이미 추출되었으므로 오타 경고 불필요
+                                pass
+                            elif rec.get('접수일자_표시', '') != '확인불가':
                                 rec['접수번호_오타'] = "⚠️ 접수번호(제____호)가 인식되지 않았습니다. 원본 확인 필요."
 
                             _parsed.append(rec)
@@ -1857,8 +1882,16 @@ if st.session_state.step == 1:
                 if base_date and len(parsed_records) > 0:
                     with st.spinner('🔍 Gemini가 매각 후 소멸 대상 권리를 분석하고 있습니다...'):
                         all_records_text = "\n".join([r['전체내용'] for r in parsed_records])
+                        # 확정된 말소 목록을 텍스트로 변환하여 참조 데이터로 전달
+                        _confirmed_malso_text = ""
+                        try:
+                            for _mi, _mr in malso_df.iterrows():
+                                _confirmed_malso_text += f"  {_mi}. {_mr['구분']} 순위번호 {_mr['순위번호']}번 - {_mr['등기목적']} ({_mr['접수일자']})\n"
+                        except Exception:
+                            pass
                         malso_omission_report = ask_gemini_for_malso_omission(
-                            all_records_text, base_date, model, spec_summary
+                            all_records_text, base_date, model, spec_summary,
+                            confirmed_malso_summary=_confirmed_malso_text if _confirmed_malso_text else None
                         )
                 st.session_state.malso_omission_report = malso_omission_report
 
@@ -1876,8 +1909,16 @@ if st.session_state.step == 1:
                 safety_report = None
                 if base_date:
                     with st.spinner('🧾 Gemini가 종합 안전도를 평가하고 있습니다...'):
+                        # 확정된 말소 목록을 텍스트로 변환하여 참조 데이터로 전달
+                        _confirmed_malso_text_sr = ""
+                        try:
+                            for _mi, _mr in malso_df.iterrows():
+                                _confirmed_malso_text_sr += f"  {_mi}. {_mr['구분']} 순위번호 {_mr['순위번호']}번 - {_mr['등기목적']} ({_mr['접수일자']})\n"
+                        except Exception:
+                            pass
                         safety_report = ask_gemini_for_safety_report(
-                            df, base_date, model, spec_summary, parsed_records
+                            df, base_date, model, spec_summary, parsed_records,
+                            confirmed_malso_summary=_confirmed_malso_text_sr if _confirmed_malso_text_sr else None
                         )
                 st.session_state.safety_report = safety_report
 
@@ -2052,6 +2093,21 @@ elif st.session_state.step == 2:
                     '유치권': '#F39C12',
                 }
 
+                # 마커 크기를 결과 중요도에 따라 차별화
+                def get_marker_size(result_str):
+                    r = str(result_str)
+                    if '절대 인수' in r:
+                        return 22
+                    if '인수' in r:
+                        return 18
+                    if '말소' in r and '이미' not in r:
+                        return 16
+                    if '이미' in r:
+                        return 10
+                    if '기본' in r:
+                        return 10
+                    return 14
+
                 def get_purpose_color(purpose, result):
                     """등기목적 기반 색상 → 결과 기반 색상 fallback"""
                     purpose_clean = str(purpose).replace(' ', '')
@@ -2066,10 +2122,42 @@ elif st.session_state.step == 2:
                 timeline_df['색상'] = timeline_df.apply(
                     lambda r: get_purpose_color(r.get('등기목적', ''), r.get('결과', '')), axis=1
                 )
-                timeline_df['Y축'] = timeline_df['구분'].apply(lambda x: 1 if '갑' in x else 2)
+                timeline_df['Y축_base'] = timeline_df['구분'].apply(lambda x: 1 if '갑' in x else 2)
                 timeline_df['날짜_str'] = timeline_df['접수일자_기준'].apply(lambda d: d.isoformat() if d else None)
 
+                # 동일 날짜 + 동일 구분 마커가 겹치지 않도록 Y축 jitter 적용
+                from collections import Counter
+                date_gu_counter = Counter()
+                y_jitter = []
+                for _, row in timeline_df.iterrows():
+                    key = (row['날짜_str'], row['Y축_base'])
+                    count = date_gu_counter[key]
+                    date_gu_counter[key] += 1
+                    jitter_offsets = [0, 0.15, -0.15, 0.25, -0.25, 0.35, -0.35]
+                    offset = jitter_offsets[count] if count < len(jitter_offsets) else 0.1 * count
+                    y_jitter.append(row['Y축_base'] + offset)
+                timeline_df['Y축'] = y_jitter
+
                 fig = go.Figure()
+
+                # 말소기준권리 이전/이후 배경색 구분 (반투명 영역)
+                if st.session_state.base_date_info:
+                    bd = st.session_state.base_date_info['date']
+                    bd_str = bd.isoformat() if hasattr(bd, 'isoformat') else str(bd)
+                    # 말소기준 이전: 연한 초록 배경 (안전)
+                    fig.add_vrect(
+                        x0=timeline_df['날짜_str'].min(), x1=bd_str,
+                        fillcolor='rgba(46,204,113,0.06)', line_width=0,
+                        annotation_text='말소기준 이전 (안전)', annotation_position='top left',
+                        annotation_font_size=10, annotation_font_color='#27ae60',
+                    )
+                    # 말소기준 이후: 연한 빨강 배경 (말소 대상)
+                    fig.add_vrect(
+                        x0=bd_str, x1=timeline_df['날짜_str'].max(),
+                        fillcolor='rgba(231,76,60,0.06)', line_width=0,
+                        annotation_text='말소기준 이후 (말소)', annotation_position='top right',
+                        annotation_font_size=10, annotation_font_color='#e74c3c',
+                    )
 
                 for _, row in timeline_df.iterrows():
                     hover_lines = [
@@ -2088,13 +2176,18 @@ elif st.session_state.step == 2:
                         except ValueError:
                             pass
                     hover_lines.append(f"🏷️ {row['결과']}")
+                    if row.get('AI_상세이유'):
+                        hover_lines.append(f"💬 {str(row['AI_상세이유'])[:60]}")
                     hover_text = "<br>".join(hover_lines)
+
+                    m_size = get_marker_size(row['결과'])
 
                     fig.add_trace(go.Scatter(
                         x=[row['날짜_str']],
                         y=[row['Y축']],
                         mode='markers+text',
-                        marker=dict(size=16, color=row['색상'], line=dict(width=2, color='white'),
+                        marker=dict(size=m_size, color=row['색상'],
+                                    line=dict(width=2, color='white'),
                                     opacity=0.9),
                         text=[str(row['순위번호'])],
                         textposition='top center',
@@ -2110,13 +2203,13 @@ elif st.session_state.step == 2:
                     fig.add_shape(
                         type='line',
                         x0=bd_str, x1=bd_str, y0=0.2, y1=2.8,
-                        line=dict(color='red', width=2, dash='dash'),
+                        line=dict(color='red', width=3, dash='dash'),
                     )
                     fig.add_annotation(
-                        x=bd_str, y=2.8,
+                        x=bd_str, y=2.9,
                         text='📌 말소기준권리',
                         showarrow=False,
-                        font=dict(color='red', size=12, family='Pretendard'),
+                        font=dict(color='red', size=13, family='Pretendard'),
                         yshift=12,
                     )
 
@@ -2135,18 +2228,29 @@ elif st.session_state.step == 2:
                     ))
 
                 fig.update_layout(
-                    title=dict(text='등기 접수일자 타임라인 (권리 종류별 색상)', font=dict(size=16)),
+                    title=dict(text='📊 등기 접수일자 타임라인 (권리 종류별 색상)', font=dict(size=16, color='#333')),
                     xaxis_title='접수일자',
+                    xaxis=dict(
+                        gridcolor='rgba(200,200,200,0.3)',
+                        linecolor='#999',
+                        tickfont=dict(color='#333', size=11),
+                        title_font=dict(color='#333'),
+                    ),
                     yaxis=dict(
                         tickvals=[1, 2],
                         ticktext=['갑구 (소유권)', '을구 (기타권리)'],
-                        range=[0.2, 3.0],
+                        range=[0.2, 3.2],
+                        gridcolor='rgba(200,200,200,0.3)',
+                        linecolor='#999',
+                        tickfont=dict(color='#333', size=12),
                     ),
                     height=600,
                     margin=dict(l=20, r=20, t=60, b=40),
                     legend=dict(orientation='h', yanchor='bottom', y=-0.2, xanchor='center', x=0.5,
-                                font=dict(size=11)),
+                                font=dict(size=11, color='#333')),
+                    paper_bgcolor='rgba(253,251,247,1)',
                     plot_bgcolor='rgba(253,251,247,1)',
+                    font=dict(color='#333'),
                     hoverlabel=dict(bgcolor='white', font_size=14, font_family='Pretendard',
                                     bordercolor='#ddd'),
                 )
