@@ -87,7 +87,12 @@ st.markdown("""
     const LIMIT_REGEX = /Limit\s+\d+(\.?\d*)\s*(MB|KB|GB)\s+per\s+file/gi;
     const LIMIT_KO = '파일당 최대 200MB';
 
+    // 업로드 중 DOM 변경 방지 플래그
+    let isUploading = false;
+
     function replaceTexts() {
+        // 파일 업로드 중에는 DOM 변경을 하지 않음 (업로드 실패 방지)
+        if (isUploading) return;
         const dropzones = document.querySelectorAll('[data-testid="stFileUploadDropzone"]');
         dropzones.forEach(zone => {
             const walker = document.createTreeWalker(zone, NodeFilter.SHOW_TEXT, null, false);
@@ -109,9 +114,28 @@ st.markdown("""
         });
     }
 
-    // 초기 실행 + DOM 변경 감시
-    const observer = new MutationObserver(replaceTexts);
-    observer.observe(document.body, { childList: true, subtree: true, characterData: true });
+    // 파일 input 변경 감지 → 업로드 중 DOM 조작 차단
+    document.addEventListener('change', function(e) {
+        if (e.target && e.target.type === 'file') {
+            isUploading = true;
+            // 업로드 완료 후 DOM 조작 재개 (충분한 대기 시간)
+            setTimeout(function() {
+                isUploading = false;
+                replaceTexts();
+            }, 3000);
+        }
+    }, true);
+
+    // Debounce: 빠른 연속 호출 방지 (파일 업로드 시 MutationObserver 과다 호출 차단)
+    let debounceTimer = null;
+    function debouncedReplaceTexts() {
+        if (debounceTimer) clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(replaceTexts, 300);
+    }
+
+    // 초기 실행 + DOM 변경 감시 (childList만 — characterData 제거로 업로드 간섭 방지)
+    const observer = new MutationObserver(debouncedReplaceTexts);
+    observer.observe(document.body, { childList: true, subtree: true });
     // 페이지 로드 후 약간의 딜레이를 두고 실행 (Streamlit 렌더링 대기)
     setTimeout(replaceTexts, 500);
     setTimeout(replaceTexts, 1500);
@@ -1309,7 +1333,37 @@ if st.session_state.step == 1:
     st.markdown("스마트폰으로 등기부등본과 매각물건명세서 사진을 찍어서 올리면, AI가 자동으로 권리를 분석해 줍니다.")
     
     # CSS로 영어 문구가 완벽히 숨겨진 업로드 창
-    uploaded_files = st.file_uploader(" ", accept_multiple_files=True, type=['jpg', 'jpeg', 'png', 'heic', 'heif'], label_visibility="collapsed")
+    uploaded_files = st.file_uploader(" ", accept_multiple_files=True, type=['jpg', 'jpeg', 'png', 'heic', 'heif'], label_visibility="collapsed", key="photo_uploader")
+
+    # =========================================================
+    # 📝 AI에게 요청할 사항 입력 영역 (최대 2회) — 권리분석 시작 바로 위
+    # =========================================================
+    with st.expander("📝 AI에게 요청할 사항 (선택사항)", expanded=bool(st.session_state.user_requests)):
+        st.caption("권리분석 시 AI가 특별히 확인하거나 반영해야 할 사항을 입력해 주세요. (최대 2회)")
+
+        # 이미 등록된 요청사항 표시
+        if st.session_state.user_requests:
+            for i, req in enumerate(st.session_state.user_requests, 1):
+                st.info(f"📌 요청 {i}: {req}")
+
+        if st.session_state.user_request_count < 2:
+            user_req_input = st.text_area(
+                "요청사항을 입력하세요",
+                placeholder="예: 전세권이 있는 경우 보증금 반환 가능성을 자세히 분석해 주세요. / 이 물건은 토지만 경매입니다. / 임차인이 실제 거주 중입니다.",
+                key="user_request_input",
+                height=80,
+                label_visibility="collapsed"
+            )
+            remaining = 2 - st.session_state.user_request_count
+            if st.button(f"📝 요청사항 등록 (남은 횟수: {remaining}회)", use_container_width=True):
+                if user_req_input and user_req_input.strip():
+                    st.session_state.user_requests.append(user_req_input.strip())
+                    st.session_state.user_request_count += 1
+                    st.rerun()
+                else:
+                    st.warning("요청사항을 입력해 주세요.")
+        else:
+            st.success("✅ 요청사항 2회를 모두 등록하셨습니다. 등록된 내용은 AI 분석에 반영됩니다.")
 
     if st.button("🚀 권리분석 시작", type="primary", use_container_width=True):
         if not uploaded_files:
@@ -1960,39 +2014,6 @@ if st.session_state.step == 1:
                 st.error(f"분석 중 오류가 발생했습니다: {e}")
 
     st.markdown("<br>", unsafe_allow_html=True)
-
-    # =========================================================
-    # 📝 AI에게 요청할 사항 입력 영역 (최대 2회)
-    # =========================================================
-    st.markdown("---")
-    st.subheader("📝 AI에게 요청할 사항")
-    st.caption("권리분석 시 AI가 특별히 확인하거나 반영해야 할 사항을 입력해 주세요. (최대 2회)")
-
-    # 이미 등록된 요청사항 표시
-    if st.session_state.user_requests:
-        for i, req in enumerate(st.session_state.user_requests, 1):
-            st.info(f"📌 요청 {i}: {req}")
-
-    if st.session_state.user_request_count < 2:
-        user_req_input = st.text_area(
-            "요청사항을 입력하세요",
-            placeholder="예: 전세권이 있는 경우 보증금 반환 가능성을 자세히 분석해 주세요. / 이 물건은 토지만 경매입니다. / 임차인이 실제 거주 중입니다.",
-            key="user_request_input",
-            height=100,
-            label_visibility="collapsed"
-        )
-        remaining = 2 - st.session_state.user_request_count
-        if st.button(f"📝 요청사항 등록 (남은 횟수: {remaining}회)", use_container_width=True):
-            if user_req_input and user_req_input.strip():
-                st.session_state.user_requests.append(user_req_input.strip())
-                st.session_state.user_request_count += 1
-                st.rerun()
-            else:
-                st.warning("요청사항을 입력해 주세요.")
-    else:
-        st.success("✅ 요청사항 2회를 모두 등록하셨습니다. 등록된 내용은 AI 분석에 반영됩니다.")
-
-    st.markdown("---")
     
     st.info("💡 **최고의 인식률을 위한 꿀팁!**\n\n무료 스캐너 앱 **'vFlat'**으로 문서를 찍어서 올리시면, 사진 용량이 1/10로 줄어들어 분석 속도와 인식률이 비약적으로 상승합니다.")
     col1, col2 = st.columns(2)
