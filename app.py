@@ -84,62 +84,85 @@ st.markdown("""
         'Browse files': '사진 선택하기',
         'Browse file': '사진 선택하기'
     };
-    const LIMIT_REGEX = /Limit\s+\d+(\.?\d*)\s*(MB|KB|GB)\s+per\s+file/gi;
-    const LIMIT_KO = '파일당 최대 500MB';
+    // 이미 교체된 한글 문구 목록 (중복 교체 방지)
+    const KO_VALUES = new Set(Object.values(REPLACEMENTS));
+    KO_VALUES.add('파일당 최대 500MB');
 
     // 업로드 중 DOM 변경 방지 플래그
     let isUploading = false;
+    // MutationObserver 재진입 방지 플래그
+    let isReplacing = false;
 
     function replaceTexts() {
-        // 파일 업로드 중에는 DOM 변경을 하지 않음 (업로드 실패 방지)
-        if (isUploading) return;
-        const dropzones = document.querySelectorAll('[data-testid="stFileUploadDropzone"]');
-        dropzones.forEach(zone => {
-            const walker = document.createTreeWalker(zone, NodeFilter.SHOW_TEXT, null, false);
-            let node;
-            while (node = walker.nextNode()) {
-                const trimmed = node.textContent.trim();
-                // 정확히 매칭되는 영어 문구 교체
-                for (const [eng, kor] of Object.entries(REPLACEMENTS)) {
-                    if (trimmed === eng) {
-                        node.textContent = kor;
+        // 업로드 중이거나, 이미 교체 작업 중이면 스킵
+        if (isUploading || isReplacing) return;
+        isReplacing = true;
+
+        try {
+            const dropzones = document.querySelectorAll('[data-testid="stFileUploadDropzone"]');
+            dropzones.forEach(zone => {
+                // 업로드 진행 중인 dropzone은 건드리지 않음 (progress bar 감지)
+                if (zone.querySelector('[role="progressbar"]') ||
+                    zone.querySelector('[data-testid="stFileUploadDeleteBtn"]')) {
+                    return;
+                }
+
+                const walker = document.createTreeWalker(zone, NodeFilter.SHOW_TEXT, null, false);
+                let node;
+                while (node = walker.nextNode()) {
+                    const text = node.textContent;
+                    const trimmed = text.trim();
+
+                    // 이미 한글로 교체된 텍스트는 스킵
+                    if (KO_VALUES.has(trimmed)) continue;
+
+                    // 정확히 매칭되는 영어 문구 교체
+                    for (const [eng, kor] of Object.entries(REPLACEMENTS)) {
+                        if (trimmed === eng) {
+                            node.textContent = kor;
+                            break;
+                        }
+                    }
+
+                    // 용량 제한 문구 교체 (부분 매칭: "Limit 200MB per file · JPG, ..." 전체 처리)
+                    const limitMatch = trimmed.match(/Limit\s+\d+(?:\.\d+)?\s*(?:MB|KB|GB)\s+per\s+file/i);
+                    if (limitMatch) {
+                        node.textContent = text.replace(limitMatch[0], '파일당 최대 500MB');
                     }
                 }
-                // 용량 제한 문구 교체
-                if (LIMIT_REGEX.test(trimmed)) {
-                    node.textContent = LIMIT_KO;
-                    LIMIT_REGEX.lastIndex = 0;
-                }
-            }
-        });
+            });
+        } finally {
+            isReplacing = false;
+        }
     }
 
-    // 파일 input 변경 감지 → 업로드 중 DOM 조작 차단
+    // 파일 input 변경 감지 → 업로드 중 DOM 조작 완전 차단
     document.addEventListener('change', function(e) {
         if (e.target && e.target.type === 'file') {
             isUploading = true;
-            // 업로드 완료 후 DOM 조작 재개 (충분한 대기 시간)
+            // 업로드 완료 후 DOM 조작 재개 (대용량 다중 파일 고려하여 충분한 대기)
             setTimeout(function() {
                 isUploading = false;
                 replaceTexts();
-            }, 3000);
+            }, 5000);
         }
     }, true);
 
-    // Debounce: 빠른 연속 호출 방지 (파일 업로드 시 MutationObserver 과다 호출 차단)
+    // Debounce: 빠른 연속 호출 방지
     let debounceTimer = null;
     function debouncedReplaceTexts() {
         if (debounceTimer) clearTimeout(debounceTimer);
-        debounceTimer = setTimeout(replaceTexts, 300);
+        debounceTimer = setTimeout(replaceTexts, 200);
     }
 
-    // 초기 실행 + DOM 변경 감시 (childList만 — characterData 제거로 업로드 간섭 방지)
+    // 초기 실행 + DOM 변경 감시 (characterData 포함 — Streamlit 텍스트 업데이트 감지 필수)
     const observer = new MutationObserver(debouncedReplaceTexts);
-    observer.observe(document.body, { childList: true, subtree: true });
-    // 페이지 로드 후 약간의 딜레이를 두고 실행 (Streamlit 렌더링 대기)
-    setTimeout(replaceTexts, 500);
-    setTimeout(replaceTexts, 1500);
-    setTimeout(replaceTexts, 3000);
+    observer.observe(document.body, { childList: true, subtree: true, characterData: true });
+    // 페이지 로드 후 딜레이를 두고 실행 (Streamlit 렌더링 대기)
+    setTimeout(replaceTexts, 300);
+    setTimeout(replaceTexts, 1000);
+    setTimeout(replaceTexts, 2000);
+    setTimeout(replaceTexts, 4000);
 })();
 </script>
 """, unsafe_allow_html=True)
